@@ -28,14 +28,64 @@ fn openclaw_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".openclaw").join("openclaw.json"))
 }
 
-// Patch ~/.openclaw/openclaw.json so the Tauri webview can connect without
-// per-device pairing approval. Idempotent. Safe to skip if the file does not
-// yet exist — OpenClaw will create it on first launch and we'll patch next time.
+fn generate_token_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
+    if getrandom::getrandom(&mut buf).is_err() {
+        // Extremely unlikely on Win/macOS/Linux. Fall back to a time-seeded
+        // value so the app still launches (token is loopback-only, never
+        // crosses the network).
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((ns >> ((i % 16) * 4)) as u8) ^ (i as u8).wrapping_mul(31);
+        }
+    }
+    let mut s = String::with_capacity(n_bytes * 2);
+    for b in &buf { s.push_str(&format!("{b:02x}")); }
+    s
+}
+
+// Bootstrap a minimal openclaw.json on first launch so the Tauri webview can
+// connect without pairing and without an interactive onboard wizard.
+fn ensure_first_run_config() {
+    let Some(path) = openclaw_config_path() else { return; };
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let token = generate_token_hex(24);
+    let template = serde_json::json!({
+        "gateway": {
+            "mode": "local",
+            "auth": { "mode": "token", "token": token },
+            "port": 18789,
+            "bind": "loopback",
+            "controlUi": {
+                "allowInsecureAuth": true,
+                "dangerouslyDisableDeviceAuth": true
+            }
+        }
+    });
+    match serde_json::to_string_pretty(&template) {
+        Ok(s) => {
+            if let Err(err) = std::fs::write(&path, s) {
+                eprintln!("[config] first-run write failed: {err}");
+            } else {
+                eprintln!("[config] wrote first-run openclaw.json (token + device-auth disabled)");
+            }
+        }
+        Err(err) => eprintln!("[config] first-run serialize failed: {err}"),
+    }
+}
+
+// Patch an existing openclaw.json so the Tauri webview can connect without
+// per-device pairing approval. Idempotent.
 fn ensure_disable_device_auth() {
     let Some(path) = openclaw_config_path() else { return; };
     if !path.exists() {
-        eprintln!("[config] no ~/.openclaw/openclaw.json yet (first run); will patch on next start");
-        return;
+        return; // first-run bootstrap handles this
     }
     let content = match std::fs::read_to_string(&path) {
         Ok(c) => c,
@@ -190,6 +240,7 @@ pub fn run() {
                 return Err(format!("openclaw entry missing in: {}", openclaw_dir.display()).into());
             }
 
+            ensure_first_run_config();
             ensure_disable_device_auth();
 
             let mut child = spawn_gateway(&node_path, &openclaw_dir)?;
