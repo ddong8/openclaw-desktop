@@ -1,8 +1,10 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{Manager, RunEvent};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::tray::TrayIconBuilder;
 use tokio::process::{Child, Command};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -21,6 +23,18 @@ fn get_api_port(state: tauri::State<AppState>) -> Option<u16> {
     *state.port.lock().unwrap()
 }
 
+// Read OpenClaw's npm package version from <openclaw_dir>/package.json so the
+// tray menu can display it as a disabled item.
+fn read_openclaw_version(openclaw_dir: &Path) -> String {
+    let path = openclaw_dir.join("package.json");
+    let Ok(s) = std::fs::read_to_string(&path) else { return "unknown".to_string(); };
+    let v: serde_json::Value = match serde_json::from_str(&s) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+    v.get("version").and_then(|x| x.as_str()).unwrap_or("unknown").to_string()
+}
+
 fn openclaw_config_path() -> Option<PathBuf> {
     let home = std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -28,96 +42,110 @@ fn openclaw_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".openclaw").join("openclaw.json"))
 }
 
-fn generate_token_hex(n_bytes: usize) -> String {
-    let mut buf = vec![0u8; n_bytes];
-    if getrandom::getrandom(&mut buf).is_err() {
-        // Extremely unlikely on Win/macOS/Linux. Fall back to a time-seeded
-        // value so the app still launches (token is loopback-only, never
-        // crosses the network).
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-        for (i, b) in buf.iter_mut().enumerate() {
-            *b = ((ns >> ((i % 16) * 4)) as u8) ^ (i as u8).wrapping_mul(31);
-        }
-    }
-    let mut s = String::with_capacity(n_bytes * 2);
-    for b in &buf { s.push_str(&format!("{b:02x}")); }
-    s
-}
-
-// Bootstrap a minimal openclaw.json on first launch so the Tauri webview can
-// connect without pairing and without an interactive onboard wizard.
-fn ensure_first_run_config() {
-    let Some(path) = openclaw_config_path() else { return; };
-    if path.exists() {
-        return;
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let token = generate_token_hex(24);
-    let template = serde_json::json!({
-        "gateway": {
-            "mode": "local",
-            "auth": { "mode": "token", "token": token },
-            "port": 18789,
-            "bind": "loopback",
-            "controlUi": {
-                "allowInsecureAuth": true,
-                "dangerouslyDisableDeviceAuth": true
-            }
-        }
-    });
-    match serde_json::to_string_pretty(&template) {
-        Ok(s) => {
-            if let Err(err) = std::fs::write(&path, s) {
-                eprintln!("[config] first-run write failed: {err}");
-            } else {
-                eprintln!("[config] wrote first-run openclaw.json (token + device-auth disabled)");
-            }
-        }
-        Err(err) => eprintln!("[config] first-run serialize failed: {err}"),
-    }
-}
-
-// Patch an existing openclaw.json so the Tauri webview can connect without
-// per-device pairing approval. Idempotent.
-fn ensure_disable_device_auth() {
-    let Some(path) = openclaw_config_path() else { return; };
-    if !path.exists() {
-        return; // first-run bootstrap handles this
-    }
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(err) => { eprintln!("[config] read failed: {err}"); return; }
-    };
-    let mut v: serde_json::Value = match serde_json::from_str(&content) {
-        Ok(v) => v,
-        Err(err) => { eprintln!("[config] parse failed: {err}"); return; }
-    };
-    if !v.get("gateway").is_some_and(|x| x.is_object()) {
-        v["gateway"] = serde_json::json!({});
-    }
-    if !v["gateway"].get("controlUi").is_some_and(|x| x.is_object()) {
-        v["gateway"]["controlUi"] = serde_json::json!({});
-    }
-    let cu = &mut v["gateway"]["controlUi"];
-    let already = cu.get("dangerouslyDisableDeviceAuth")
+fn config_has_device_auth_disabled() -> bool {
+    let Some(path) = openclaw_config_path() else { return false; };
+    let Ok(content) = std::fs::read_to_string(&path) else { return false; };
+    let Ok(v): Result<serde_json::Value, _> = serde_json::from_str(&content) else { return false; };
+    v.get("gateway")
+        .and_then(|g| g.get("controlUi"))
+        .and_then(|c| c.get("dangerouslyDisableDeviceAuth"))
         .and_then(|x| x.as_bool())
-        .unwrap_or(false);
-    if already {
+        .unwrap_or(false)
+}
+
+fn config_has_token() -> bool {
+    read_gateway_token().is_some()
+}
+
+// Run a one-shot openclaw CLI command synchronously, inheriting stdin/stdout.
+// Returns the exit status of the child or None on spawn failure.
+fn run_openclaw_cli(
+    node_path: &std::path::Path,
+    openclaw_dir: &std::path::Path,
+    args: &[&str],
+    stdin_data: Option<&str>,
+) -> Option<std::process::ExitStatus> {
+    let mut cmd = std::process::Command::new(node_path);
+    cmd.arg("openclaw.mjs").args(args).current_dir(openclaw_dir);
+
+    #[cfg(windows)]
+    {
+        // CREATE_NO_WINDOW = 0x08000000 — hide the console window
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
+    if let Some(input) = stdin_data {
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(err) => { eprintln!("[cli] spawn `openclaw {args:?}` failed: {err}"); return None; }
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(input.as_bytes());
+        }
+        match child.wait() {
+            Ok(s) => Some(s),
+            Err(err) => { eprintln!("[cli] wait failed: {err}"); None }
+        }
+    } else {
+        cmd.stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        match cmd.status() {
+            Ok(s) => Some(s),
+            Err(err) => { eprintln!("[cli] run `openclaw {args:?}` failed: {err}"); None }
+        }
+    }
+}
+
+// Ensure ~/.openclaw/openclaw.json exists AND has
+// gateway.controlUi.dangerouslyDisableDeviceAuth=true / allowInsecureAuth=true.
+//
+// We use OpenClaw's own CLI (`doctor --generate-gateway-token`, `config patch
+// --stdin`) so OpenClaw owns the serialized representation and the Control UI's
+// Raw editor stays available (it disables itself when the config can't safely
+// round-trip raw text).
+fn ensure_openclaw_config(node_path: &std::path::Path, openclaw_dir: &std::path::Path) {
+    let path = match openclaw_config_path() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let device_auth_ok = config_has_device_auth_disabled();
+    let token_ok = config_has_token();
+    if path.exists() && device_auth_ok && token_ok {
         return;
     }
-    cu["dangerouslyDisableDeviceAuth"] = serde_json::json!(true);
-    match serde_json::to_string_pretty(&v) {
-        Ok(s) => {
-            if let Err(err) = std::fs::write(&path, s) {
-                eprintln!("[config] write failed: {err}");
-            } else {
-                eprintln!("[config] patched gateway.controlUi.dangerouslyDisableDeviceAuth = true");
+
+    // First-run case: ask OpenClaw to generate its own gateway token + base config.
+    if !path.exists() || !token_ok {
+        eprintln!("[config] bootstrapping via `openclaw doctor --generate-gateway-token`");
+        let status = run_openclaw_cli(
+            node_path,
+            openclaw_dir,
+            &["doctor", "--generate-gateway-token", "--non-interactive"],
+            None,
+        );
+        if let Some(s) = status {
+            if !s.success() {
+                eprintln!("[config] doctor exited with {s:?}");
             }
         }
-        Err(err) => eprintln!("[config] serialize failed: {err}"),
+    }
+
+    // Apply our device-auth overrides via patch (validated, raw-safe).
+    if !config_has_device_auth_disabled() {
+        eprintln!("[config] patching gateway.controlUi via `openclaw config patch`");
+        let patch = r#"{"gateway":{"controlUi":{"dangerouslyDisableDeviceAuth":true,"allowInsecureAuth":true}}}"#;
+        let status = run_openclaw_cli(node_path, openclaw_dir, &["config", "patch", "--stdin"], Some(patch));
+        if let Some(s) = status {
+            if !s.success() {
+                eprintln!("[config] config patch exited with {s:?}");
+            }
+        }
     }
 }
 
@@ -136,6 +164,8 @@ fn read_gateway_token() -> Option<String> {
 }
 
 fn resolve_sidecar_paths(app: &tauri::AppHandle) -> tauri::Result<(PathBuf, PathBuf)> {
+    // node_path and openclaw_dir are kept as PathBuf for ergonomic .clone()
+    // in async closures.
     let node_exe = if cfg!(windows) { "node.exe" } else { "node" };
 
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -171,7 +201,7 @@ fn resolve_sidecar_paths(app: &tauri::AppHandle) -> tauri::Result<(PathBuf, Path
     Ok((fallback.join("node").join(node_exe), fallback.join("openclaw")))
 }
 
-fn spawn_gateway(node_path: &PathBuf, openclaw_dir: &PathBuf) -> std::io::Result<Child> {
+fn spawn_gateway(node_path: &Path, openclaw_dir: &Path) -> std::io::Result<Child> {
     let mut cmd = Command::new(node_path);
     cmd.arg("openclaw.mjs")
         .arg("gateway")
@@ -240,8 +270,89 @@ pub fn run() {
                 return Err(format!("openclaw entry missing in: {}", openclaw_dir.display()).into());
             }
 
-            ensure_first_run_config();
-            ensure_disable_device_auth();
+            ensure_openclaw_config(&node_path, &openclaw_dir);
+
+            // ---- Tray icon + menu ----
+            {
+                let oc_version = read_openclaw_version(&openclaw_dir);
+                let shell_version = env!("CARGO_PKG_VERSION");
+                let about_label = format!("OpenClaw v{oc_version} (shell {shell_version})");
+
+                let menu = Menu::with_items(app, &[
+                    &MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(app, "open_config", "打开配置文件", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "open_data", "打开配置目录", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(app, "restart", "重启服务", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "upgrade", "升级 OpenClaw", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(app, "about", &about_label, false, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
+                ])?;
+
+                let node_for_menu = node_path.clone();
+                let openclaw_for_menu = openclaw_dir.clone();
+
+                let mut tray_builder = TrayIconBuilder::with_id("main-tray")
+                    .menu(&menu)
+                    .show_menu_on_left_click(false)
+                    .tooltip("OpenClaw")
+                    .on_menu_event(move |app, event| {
+                        let id = event.id.as_ref();
+                        match id {
+                            "show" => {
+                                if let Some(w) = app.get_webview_window("main") {
+                                    let _ = w.show();
+                                    let _ = w.unminimize();
+                                    let _ = w.set_focus();
+                                }
+                            }
+                            "open_config" => {
+                                if let Some(path) = openclaw_config_path() {
+                                    use tauri_plugin_opener::OpenerExt;
+                                    let s = path.to_string_lossy().into_owned();
+                                    if let Err(err) = app.opener().open_path(s, None::<&str>) {
+                                        eprintln!("[tray] open_config failed: {err}");
+                                    }
+                                }
+                            }
+                            "open_data" => {
+                                if let Some(path) = openclaw_config_path().and_then(|p| p.parent().map(|x| x.to_path_buf())) {
+                                    use tauri_plugin_opener::OpenerExt;
+                                    let s = path.to_string_lossy().into_owned();
+                                    if let Err(err) = app.opener().open_path(s, None::<&str>) {
+                                        eprintln!("[tray] open_data failed: {err}");
+                                    }
+                                }
+                            }
+                            "restart" => {
+                                eprintln!("[tray] restart requested — relaunching app");
+                                app.restart();
+                            }
+                            "upgrade" => {
+                                let node = node_for_menu.clone();
+                                let dir = openclaw_for_menu.clone();
+                                std::thread::spawn(move || {
+                                    eprintln!("[tray] running `openclaw update --yes` in background…");
+                                    let status = run_openclaw_cli(&node, &dir, &["update", "--yes"], None);
+                                    eprintln!("[tray] update exited: {status:?}");
+                                });
+                            }
+                            "quit" => {
+                                app.exit(0);
+                            }
+                            _ => {}
+                        }
+                    });
+
+                // Reuse the app window icon (the lobster).
+                if let Some(icon) = app.default_window_icon() {
+                    tray_builder = tray_builder.icon(icon.clone());
+                }
+                tray_builder.build(app)?;
+            }
 
             let mut child = spawn_gateway(&node_path, &openclaw_dir)?;
 
