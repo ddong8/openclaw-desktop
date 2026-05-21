@@ -1,0 +1,29 @@
+[package]
+name = "openclaw-desktop"
+version = "0.1.0"
+description = "Tauri shell that runs OpenClaw Gateway as an embedded sidecar"
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "openclaw_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+log = "0.4"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

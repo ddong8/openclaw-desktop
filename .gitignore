@@ -1,0 +1,43 @@
+# OpenClaw upstream source (cloned, treated as a build input — not part of our source)
+openclaw/
+
+# OpenClaw npm runtime (created by `npm install openclaw@latest`)
+openclaw-runtime/
+openclaw-runtime2/
+
+# Node
+node_modules/
+pnpm-debug.log
+pnpm-install.log
+pnpm-build.log
+pnpm-runtime-install.log
+npm-runtime-install.log
+npm-runtime2-install.log
+desktop-pnpm-install.log
+ui-build.log
+tauri-dev.log
+tauri-build.log
+prepare-bundle.log
+prepare-bundle2.log
+gateway-verify.log
+gateway-verify.err
+
+# Tauri / Rust build outputs
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop/src-tauri/resources/
+desktop/dist/
+desktop/node_modules/
+
+# Portable Node.js binaries staged for bundling
+portable-node/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Tauri-generated icons cache
+*.iconset/

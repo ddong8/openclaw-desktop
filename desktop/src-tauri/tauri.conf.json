@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "OpenClaw",
+  "version": "0.1.0",
+  "identifier": "ai.openclaw.desktop",
+  "build": {
+    "frontendDist": "../splash",
+    "devUrl": null,
+    "beforeDevCommand": null,
+    "beforeBuildCommand": null
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [],
+    "security": {
+      "csp": null,
+      "dangerousDisableAssetCspModification": false,
+      "capabilities": ["default"]
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["msi", "nsis"],
+    "category": "Productivity",
+    "copyright": "Copyright (c) 2026 OpenClaw-Desktop. OpenClaw (c) 2025 Peter Steinberger (MIT).",
+    "shortDescription": "OpenClaw Personal AI Assistant — desktop edition.",
+    "longDescription": "Tauri-packaged desktop client that ships an embedded Node.js runtime and the OpenClaw Gateway. The window loads the OpenClaw Control UI which serves chat, sessions, and configuration entirely from your local machine.",
+    "resources": [
+      "resources/node/**/*",
+      "resources/openclaw/**/*"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "wix": null,
+      "nsis": {
+        "installMode": "perMachine"
+      }
+    }
+  }
+}

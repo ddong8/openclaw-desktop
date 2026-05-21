@@ -1,0 +1,4 @@
+# Limit parallel rustc jobs to avoid LLVM OOM on Windows for heavy Tauri deps
+# (muda, hyper, tower crash at link-time when too many rustc processes run concurrently).
+[build]
+jobs = 2
