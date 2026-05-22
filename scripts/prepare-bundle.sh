@@ -54,5 +54,14 @@ rsync -a --delete --exclude='openclaw' --exclude='.git' "$RUNTIME_ROOT/node_modu
 echo "==> Strip .d.ts / .map (compile-time only; runtime unaffected)"
 find "$RES/openclaw" -type f \( -name '*.map' -o -name '*.d.ts' -o -name '*.d.cts' -o -name '*.d.mts' \) -delete 2>/dev/null || true
 
+# Drop nested @mistralai duplicates. pi-coding-agent keeps its own copy whose
+# very long Mistral SDK filenames break Windows NSIS MAX_PATH. The top-level
+# @mistralai (same 2.2.1, pinned via overrides) resolves for it via normal Node
+# module lookup → zero functional impact.
+TOP_MISTRAL="$RES/openclaw/node_modules/@mistralai"
+find "$RES/openclaw" -type d -name '@mistralai' 2>/dev/null | while read -r d; do
+  if [ "$d" != "$TOP_MISTRAL" ]; then echo "    drop nested $d"; rm -rf "$d"; fi
+done
+
 echo "==> Done. resources total: $(du -sm "$RES" | cut -f1) MB"
 echo "    Next: (cd desktop && pnpm tauri build)"

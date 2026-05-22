@@ -118,6 +118,14 @@ Step "Strip .d.ts / .map (compile-time only; runtime unaffected)"
 Get-ChildItem $resOpenClawDir -Recurse -File -Include *.map, *.d.ts, *.d.cts, *.d.mts -ErrorAction SilentlyContinue |
   Remove-Item -Force -ErrorAction SilentlyContinue
 
+# Drop nested @mistralai duplicates (pi-coding-agent's copy has very long SDK
+# filenames that break Windows NSIS MAX_PATH). The top-level @mistralai (same
+# 2.2.1) resolves via normal Node lookup → zero functional impact.
+$topMistral = Join-Path $resOpenClawDir "node_modules\@mistralai"
+Get-ChildItem $resOpenClawDir -Recurse -Directory -Filter "@mistralai" -ErrorAction SilentlyContinue |
+  Where-Object { $_.FullName -ne $topMistral } |
+  ForEach-Object { Info "drop nested $($_.FullName)"; Remove-Item -Recurse -Force $_.FullName -ErrorAction SilentlyContinue }
+
 $sizeMb = [math]::Round((Get-ChildItem $resOpenClawDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
 Info "openclaw/ runtime bundle size: $sizeMb MB"
 
