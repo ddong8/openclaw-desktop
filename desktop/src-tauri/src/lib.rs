@@ -42,14 +42,34 @@ fn openclaw_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".openclaw").join("openclaw.json"))
 }
 
+fn read_config_value() -> Option<serde_json::Value> {
+    let path = openclaw_config_path()?;
+    let content = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
 fn config_has_device_auth_disabled() -> bool {
-    let Some(path) = openclaw_config_path() else { return false; };
-    let Ok(content) = std::fs::read_to_string(&path) else { return false; };
-    let Ok(v): Result<serde_json::Value, _> = serde_json::from_str(&content) else { return false; };
-    v.get("gateway")
-        .and_then(|g| g.get("controlUi"))
-        .and_then(|c| c.get("dangerouslyDisableDeviceAuth"))
-        .and_then(|x| x.as_bool())
+    read_config_value()
+        .and_then(|v| {
+            v.get("gateway")
+                .and_then(|g| g.get("controlUi"))
+                .and_then(|c| c.get("dangerouslyDisableDeviceAuth"))
+                .and_then(|x| x.as_bool())
+        })
+        .unwrap_or(false)
+}
+
+// gateway.mode must be present (e.g. "local") or `openclaw gateway` refuses to
+// start with "existing config is missing gateway.mode". A config created by an
+// older build (device-auth only) lacks it, so we must detect + repair.
+fn config_has_gateway_mode() -> bool {
+    read_config_value()
+        .and_then(|v| {
+            v.get("gateway")
+                .and_then(|g| g.get("mode"))
+                .and_then(|m| m.as_str())
+                .map(|s| !s.is_empty())
+        })
         .unwrap_or(false)
 }
 
@@ -134,8 +154,11 @@ fn run_openclaw_cli(
 // that hangs in the TTY-less sidecar — that was the "stuck on gateway startup"
 // bug on fresh machines.
 fn ensure_openclaw_config(node_path: &std::path::Path, openclaw_dir: &std::path::Path) {
-    if config_has_device_auth_disabled() && config_has_token() {
-        return; // warm start — already configured, zero latency
+    // All three must hold, else (re)apply. gateway.mode is critical: an older
+    // build wrote device-auth + token but no gateway.mode, which makes
+    // `openclaw gateway` refuse to start and hang the splash forever.
+    if config_has_gateway_mode() && config_has_device_auth_disabled() && config_has_token() {
+        return; // warm start — already fully configured, zero latency
     }
 
     let token = read_gateway_token().unwrap_or_else(|| generate_token_hex(24));
