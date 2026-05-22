@@ -33,6 +33,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      - name: Enable Windows long paths (NSIS packs deeply-nested node_modules)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force | Out-Null
+          git config --system core.longpaths true
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -63,6 +70,9 @@ jobs:
           cd openclaw-runtime2
           [ -f package.json ] || echo '{"name":"openclaw-runtime","private":true,"version":"0.0.0"}' > package.json
           npm install openclaw@latest --no-fund --no-audit --loglevel=warn
+          # Hoist nested deps (e.g. @mistralai under @earendil-works/pi-coding-agent)
+          # to the top level so Windows NSIS doesn't hit MAX_PATH on deep paths.
+          npm dedupe --no-fund --no-audit || true
 
       - name: Prepare bundle (Windows)
         if: runner.os == 'Windows'
@@ -91,10 +101,11 @@ jobs:
         shell: bash
         run: cd desktop && pnpm tauri build --bundles dmg
 
-      - name: Tauri build (Linux → .deb + .AppImage)
+      # AppImage's linuxdeploy chokes on the ~1.2GB AppDir; ship .deb only.
+      - name: Tauri build (Linux → .deb)
         if: runner.os == 'Linux'
         shell: bash
-        run: cd desktop && pnpm tauri build --bundles deb,appimage
+        run: cd desktop && pnpm tauri build --bundles deb
 
       - name: Upload installers
         uses: actions/upload-artifact@v4

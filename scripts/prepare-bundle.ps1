@@ -111,6 +111,13 @@ $null = & robocopy $siblingNodeModules $destNodeModules /MIR /R:2 /W:2 /NJH /NJS
 if ($LASTEXITCODE -ge 8) { throw "robocopy node_modules failed: $LASTEXITCODE" }
 $global:LASTEXITCODE = 0
 
+# Strip compile-time-only files: TypeScript declarations + sourcemaps.
+# Node never loads these at runtime, so this is NOT a feature cut (no .js removed).
+# It also shortens deep SDK paths that otherwise hit Windows MAX_PATH in NSIS.
+Step "Strip .d.ts / .map (compile-time only; runtime unaffected)"
+Get-ChildItem $resOpenClawDir -Recurse -File -Include *.map, *.d.ts, *.d.cts, *.d.mts -ErrorAction SilentlyContinue |
+  Remove-Item -Force -ErrorAction SilentlyContinue
+
 $sizeMb = [math]::Round((Get-ChildItem $resOpenClawDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
 Info "openclaw/ runtime bundle size: $sizeMb MB"
 

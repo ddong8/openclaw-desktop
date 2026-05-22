@@ -49,5 +49,10 @@ echo "    node: $(du -m "$RES/node/node" | cut -f1) MB"
 rsync -a --delete --exclude='.git' --exclude='test' --exclude='__screenshots__' "$RUNTIME/" "$RES/openclaw/"
 rsync -a --delete --exclude='openclaw' --exclude='.git' "$RUNTIME_ROOT/node_modules/" "$RES/openclaw/node_modules/"
 
+# Strip compile-time-only files (TS decls + sourcemaps). Node never loads these
+# at runtime — not a feature cut — and it shortens deep SDK paths for Windows.
+echo "==> Strip .d.ts / .map (compile-time only; runtime unaffected)"
+find "$RES/openclaw" -type f \( -name '*.map' -o -name '*.d.ts' -o -name '*.d.cts' -o -name '*.d.mts' \) -delete 2>/dev/null || true
+
 echo "==> Done. resources total: $(du -sm "$RES" | cut -f1) MB"
 echo "    Next: (cd desktop && pnpm tauri build)"
