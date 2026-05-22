@@ -1,0 +1,95 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows
+          - os: macos-latest      # Apple Silicon (arm64)
+            label: macos-arm64
+          - os: ubuntu-22.04
+            label: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Enable pnpm via corepack
+        shell: bash
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.1.0 --activate
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            desktop/src-tauri/target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
+
+      - name: Linux system deps (WebKitGTK + tray + AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libayatana-appindicator3-dev
+
+      # OpenClaw npm runtime — fetches platform-correct native binaries
+      # (sharp / sqlite-vec / node-pty / tree-sitter) for THIS runner's OS+arch.
+      - name: Install OpenClaw npm runtime
+        shell: bash
+        run: |
+          mkdir -p openclaw-runtime2
+          cd openclaw-runtime2
+          [ -f package.json ] || echo '{"name":"openclaw-runtime","private":true,"version":"0.0.0"}' > package.json
+          npm install openclaw@latest --no-fund --no-audit --loglevel=warn
+
+      - name: Prepare bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/prepare-bundle.ps1 -SkipInstall -SkipUiBuild
+
+      - name: Prepare bundle (macOS / Linux)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/prepare-bundle.sh
+
+      - name: Install Tauri CLI
+        shell: bash
+        run: cd desktop && pnpm install
+
+      - name: Tauri build
+        shell: bash
+        run: cd desktop && pnpm tauri build
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: openclaw-${{ matrix.label }}
+          if-no-files-found: warn
+          path: |
+            desktop/src-tauri/target/release/bundle/**/*.exe
+            desktop/src-tauri/target/release/bundle/**/*.msi
+            desktop/src-tauri/target/release/bundle/**/*.dmg
+            desktop/src-tauri/target/release/bundle/**/*.deb
+            desktop/src-tauri/target/release/bundle/**/*.rpm
+            desktop/src-tauri/target/release/bundle/**/*.AppImage
