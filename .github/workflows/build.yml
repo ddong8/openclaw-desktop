@@ -68,11 +68,15 @@ jobs:
         run: |
           mkdir -p openclaw-runtime2
           cd openclaw-runtime2
-          [ -f package.json ] || echo '{"name":"openclaw-runtime","private":true,"version":"0.0.0"}' > package.json
+          # Force a single, top-level @mistralai/mistralai (2.2.1 — the version a
+          # local flat install resolves to and runs fine). Without this, CI nests
+          # it under @earendil-works/pi-coding-agent/node_modules/@mistralai/, and
+          # its very long SDK filenames blow past Windows MAX_PATH in the NSIS packer.
+          echo '{"name":"openclaw-runtime","private":true,"version":"0.0.0","overrides":{"@mistralai/mistralai":"2.2.1"}}' > package.json
           npm install openclaw@latest --no-fund --no-audit --loglevel=warn
-          # Hoist nested deps (e.g. @mistralai under @earendil-works/pi-coding-agent)
-          # to the top level so Windows NSIS doesn't hit MAX_PATH on deep paths.
           npm dedupe --no-fund --no-audit || true
+          echo "=== @mistralai locations (expect ONLY top-level) ==="
+          find node_modules -path '*/@mistralai/mistralai/package.json' || true
 
       - name: Prepare bundle (Windows)
         if: runner.os == 'Windows'
