@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use tauri::{Manager, RunEvent};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tokio::process::{Child, Command};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -252,10 +252,14 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![get_api_port])
         .on_window_event(|window, event| {
-            // Forward webview popup requests (window.open / target="_blank") to system browser.
-            // Tauri does this via the navigation handler below, but we leave this hook in place
-            // for any future window-level signals.
-            let _ = (window, event);
+            // Hide the window on close instead of quitting — the embedded
+            // OpenClaw gateway must stay running so channel webhooks
+            // (WeChat / Telegram / etc.) keep receiving messages. The user
+            // exits the app explicitly via the tray "退出" menu item.
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
         })
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -299,6 +303,23 @@ pub fn run() {
                     .menu(&menu)
                     .show_menu_on_left_click(false)
                     .tooltip("OpenClaw")
+                    .on_tray_icon_event(|tray, event| {
+                        // Left-click → restore + focus the main window.
+                        // Right-click is handled by the menu (show_menu_on_left_click=false).
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            let app = tray.app_handle();
+                            if let Some(w) = app.get_webview_window("main") {
+                                let _ = w.show();
+                                let _ = w.unminimize();
+                                let _ = w.set_focus();
+                            }
+                        }
+                    })
                     .on_menu_event(move |app, event| {
                         let id = event.id.as_ref();
                         match id {

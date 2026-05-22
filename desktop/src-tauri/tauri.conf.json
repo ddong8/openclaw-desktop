@@ -39,7 +39,8 @@
     "windows": {
       "wix": null,
       "nsis": {
-        "installMode": "perMachine"
+        "installMode": "perMachine",
+        "installerHooks": "installer-hooks.nsi"
       }
     }
   }
