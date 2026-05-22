@@ -18,9 +18,18 @@
       "capabilities": ["default"]
     }
   },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFFQTc5RTIzM0FBNjI1MDIKUldRQ0phWTZJNTZucnYxeUx4aTNrS3pPWEk2MkJXQ21oa3BsZ3B6QnJNcGpGS3o1eThHQ1NOeHIK",
+      "endpoints": [
+        "https://github.com/ddong8/openclaw-desktop/releases/latest/download/latest.json"
+      ]
+    }
+  },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "category": "Productivity",
     "copyright": "Copyright (c) 2026 OpenClaw-Desktop. OpenClaw (c) 2025 Peter Steinberger (MIT).",
     "shortDescription": "OpenClaw Personal AI Assistant — desktop edition.",

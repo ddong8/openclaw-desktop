@@ -277,9 +277,65 @@ async fn wait_for_ready() -> bool {
     false
 }
 
+// Check GitHub Releases for a newer signed build; prompt the user, then
+// download + install + restart. Runs best-effort: any failure (offline,
+// no update, GitHub unreachable) is logged and ignored.
+async fn check_for_update(app: tauri::AppHandle) {
+    use tauri_plugin_updater::UpdaterExt;
+
+    let updater = match app.updater() {
+        Ok(u) => u,
+        Err(err) => { eprintln!("[updater] init failed: {err}"); return; }
+    };
+    let update = match updater.check().await {
+        Ok(Some(u)) => u,
+        Ok(None) => { eprintln!("[updater] already up to date"); return; }
+        Err(err) => { eprintln!("[updater] check failed: {err}"); return; }
+    };
+
+    let new_ver = update.version.clone();
+    let cur_ver = update.current_version.clone();
+    eprintln!("[updater] update available: {cur_ver} -> {new_ver}");
+
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+    let approved = app
+        .dialog()
+        .message(format!(
+            "发现新版本 {new_ver}(当前 {cur_ver})。\n现在下载并更新?更新完成后应用会自动重启。"
+        ))
+        .title("OpenClaw 有可用更新")
+        .kind(MessageDialogKind::Info)
+        .buttons(MessageDialogButtons::OkCancelCustom("立即更新".to_string(), "稍后".to_string()))
+        .blocking_show();
+
+    if !approved {
+        eprintln!("[updater] user postponed update");
+        return;
+    }
+
+    match update.download_and_install(|_downloaded, _total| {}, || {}).await {
+        Ok(_) => {
+            eprintln!("[updater] installed {new_ver}; restarting");
+            app.restart();
+        }
+        Err(err) => {
+            eprintln!("[updater] download/install failed: {err}");
+            let _ = app
+                .dialog()
+                .message(format!("更新失败:{err}\n可前往 GitHub Releases 手动下载。"))
+                .title("更新失败")
+                .kind(MessageDialogKind::Error)
+                .blocking_show();
+        }
+    }
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![get_api_port])
         .on_window_event(|window, event| {
@@ -326,9 +382,6 @@ pub fn run() {
                     &PredefinedMenuItem::separator(app)?,
                     &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
                 ])?;
-
-                let node_for_menu = node_path.clone();
-                let openclaw_for_menu = openclaw_dir.clone();
 
                 let mut tray_builder = TrayIconBuilder::with_id("main-tray")
                     .menu(&menu)
@@ -384,19 +437,10 @@ pub fn run() {
                                 app.restart();
                             }
                             "upgrade" => {
-                                let node = node_for_menu.clone();
-                                let dir = openclaw_for_menu.clone();
-                                std::thread::spawn(move || {
-                                    eprintln!("[tray] running `openclaw update --yes` in background…");
-                                    let status = run_openclaw_cli(
-                                        &node,
-                                        &dir,
-                                        &["update", "--yes"],
-                                        None,
-                                        Duration::from_secs(1800),
-                                    );
-                                    eprintln!("[tray] update exited: {status:?}");
-                                });
+                                // Check GitHub Releases via tauri-plugin-updater
+                                // (downloads a newer signed build of the whole app).
+                                eprintln!("[tray] manual update check requested");
+                                tauri::async_runtime::spawn(check_for_update(app.clone()));
                             }
                             "quit" => {
                                 app.exit(0);
@@ -514,6 +558,16 @@ pub fn run() {
                     );
                 }
             });
+
+            // Auto-check for app updates ~15s after launch (best-effort, prompts on found).
+            #[cfg(not(debug_assertions))]
+            {
+                let update_handle = app_handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    check_for_update(update_handle).await;
+                });
+            }
 
             Ok(())
         })

@@ -1,0 +1,60 @@
+name: check-upstream
+
+# Daily check for a new STABLE openclaw npm release. When found, bump the app
+# version to match, commit, and tag v<version> — which triggers build.yml to
+# build, sign, and publish a GitHub Release that the in-app updater picks up.
+on:
+  schedule:
+    - cron: "0 2 * * *" # 02:00 UTC daily
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Check upstream + bump + tag if newer
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UPSTREAM="$(npm view openclaw version)"
+          echo "upstream openclaw (latest dist-tag): $UPSTREAM"
+
+          # Only ship stable. Skip if npm 'latest' somehow points at a prerelease.
+          if echo "$UPSTREAM" | grep -qiE 'beta|rc|alpha|next|canary|-'; then
+            echo "::notice::upstream $UPSTREAM looks like a prerelease — skipping"
+            exit 0
+          fi
+
+          CURRENT="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
+          echo "current app version: $CURRENT"
+
+          if [ "$UPSTREAM" = "$CURRENT" ]; then
+            echo "already up to date ($UPSTREAM) — nothing to do"
+            exit 0
+          fi
+
+          if git ls-remote --tags origin "refs/tags/v$UPSTREAM" | grep -q "v$UPSTREAM"; then
+            echo "tag v$UPSTREAM already exists — nothing to do"
+            exit 0
+          fi
+
+          echo "::notice::new upstream openclaw $UPSTREAM (was $CURRENT) — releasing"
+          node -e "const f='./desktop/src-tauri/tauri.conf.json';const j=require(f);j.version='$UPSTREAM';require('fs').writeFileSync(f, JSON.stringify(j,null,2)+'\n')"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add desktop/src-tauri/tauri.conf.json
+          git commit -m "release: openclaw $UPSTREAM (auto)"
+          git tag "v$UPSTREAM"
+          git push origin HEAD:master
+          git push origin "v$UPSTREAM"

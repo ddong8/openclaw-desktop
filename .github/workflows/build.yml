@@ -5,6 +5,10 @@ on:
     tags: ["v*"]
   workflow_dispatch: {}
 
+# Needed for tauri-action to create the GitHub Release.
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -13,10 +17,13 @@ jobs:
         include:
           - os: windows-latest
             label: windows
-          - os: macos-latest      # Apple Silicon (arm64)
+            args: "--bundles nsis"
+          - os: macos-latest          # Apple Silicon (arm64)
             label: macos-arm64
+            args: "--bundles app,dmg"
           - os: ubuntu-22.04
             label: linux-x64
+            args: "--bundles deb"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -49,34 +56,26 @@ jobs:
             desktop/src-tauri/target
           key: ${{ matrix.os }}-cargo-${{ hashFiles('desktop/src-tauri/Cargo.lock') }}
 
-      - name: Linux system deps (WebKitGTK + tray + AppImage)
+      - name: Linux system deps (WebKitGTK + tray)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # NOTE: use ONLY libayatana-appindicator3-dev (the modern tray lib).
-          # libappindicator3-dev conflicts with it on Ubuntu 22.04.
           sudo apt-get install -y \
             libwebkit2gtk-4.1-dev \
             librsvg2-dev \
             patchelf \
             libayatana-appindicator3-dev
 
-      # OpenClaw npm runtime — fetches platform-correct native binaries
-      # (sharp / sqlite-vec / node-pty / tree-sitter) for THIS runner's OS+arch.
       - name: Install OpenClaw npm runtime
         shell: bash
         run: |
           mkdir -p openclaw-runtime2
           cd openclaw-runtime2
-          # Force a single, top-level @mistralai/mistralai (2.2.1 — the version a
-          # local flat install resolves to and runs fine). Without this, CI nests
-          # it under @earendil-works/pi-coding-agent/node_modules/@mistralai/, and
-          # its very long SDK filenames blow past Windows MAX_PATH in the NSIS packer.
+          # Pin a single top-level @mistralai/mistralai (avoids nested deep paths
+          # that blow Windows MAX_PATH in the NSIS packer).
           echo '{"name":"openclaw-runtime","private":true,"version":"0.0.0","overrides":{"@mistralai/mistralai":"2.2.1"}}' > package.json
           npm install openclaw@latest --no-fund --no-audit --loglevel=warn
           npm dedupe --no-fund --no-audit || true
-          echo "=== @mistralai locations (expect ONLY top-level) ==="
-          find node_modules -path '*/@mistralai/mistralai/package.json' || true
 
       - name: Prepare bundle (Windows)
         if: runner.os == 'Windows'
@@ -88,38 +87,24 @@ jobs:
         shell: bash
         run: bash scripts/prepare-bundle.sh
 
-      - name: Install Tauri CLI
+      - name: Install Tauri CLI deps
         shell: bash
         run: cd desktop && pnpm install
 
-      # Per-platform bundle targets. MSI is intentionally skipped on Windows:
-      # WiX light.exe fails packaging the ~1.2GB payload on CI runners, and the
-      # NSIS .exe is the primary distributable anyway.
-      - name: Tauri build (Windows → NSIS .exe)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: cd desktop && pnpm tauri build --bundles nsis
-
-      - name: Tauri build (macOS → .dmg)
-        if: runner.os == 'macOS'
-        shell: bash
-        run: cd desktop && pnpm tauri build --bundles dmg
-
-      # AppImage's linuxdeploy chokes on the ~1.2GB AppDir; ship .deb only.
-      - name: Tauri build (Linux → .deb)
-        if: runner.os == 'Linux'
-        shell: bash
-        run: cd desktop && pnpm tauri build --bundles deb
-
-      - name: Upload installers
-        uses: actions/upload-artifact@v4
+      # Build + sign + upload to a single GitHub Release, and merge the
+      # cross-platform updater manifest (latest.json) used by the in-app updater.
+      - name: Build, sign, release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          name: openclaw-${{ matrix.label }}
-          if-no-files-found: warn
-          path: |
-            desktop/src-tauri/target/release/bundle/**/*.exe
-            desktop/src-tauri/target/release/bundle/**/*.msi
-            desktop/src-tauri/target/release/bundle/**/*.dmg
-            desktop/src-tauri/target/release/bundle/**/*.deb
-            desktop/src-tauri/target/release/bundle/**/*.rpm
-            desktop/src-tauri/target/release/bundle/**/*.AppImage
+          projectPath: desktop
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.0-dev' }}
+          releaseName: "OpenClaw ${{ github.ref_name }}"
+          releaseBody: "OpenClaw Desktop — automated release. See assets below for your platform. The app auto-updates from this channel."
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
