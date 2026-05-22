@@ -57,95 +57,103 @@ fn config_has_token() -> bool {
     read_gateway_token().is_some()
 }
 
-// Run a one-shot openclaw CLI command synchronously, inheriting stdin/stdout.
-// Returns the exit status of the child or None on spawn failure.
+fn generate_token_hex(n_bytes: usize) -> String {
+    let mut buf = vec![0u8; n_bytes];
+    if getrandom::getrandom(&mut buf).is_err() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ns = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = ((ns >> ((i % 16) * 4)) as u8) ^ (i as u8).wrapping_mul(31);
+        }
+    }
+    let mut s = String::with_capacity(n_bytes * 2);
+    for b in &buf { s.push_str(&format!("{b:02x}")); }
+    s
+}
+
+// Run a one-shot openclaw CLI command with a hard timeout. Polls try_wait so a
+// hung child (e.g. an unexpected interactive prompt in the TTY-less sidecar)
+// can never block app startup — it gets killed at the deadline.
 fn run_openclaw_cli(
     node_path: &std::path::Path,
     openclaw_dir: &std::path::Path,
     args: &[&str],
     stdin_data: Option<&str>,
+    timeout: Duration,
 ) -> Option<std::process::ExitStatus> {
     let mut cmd = std::process::Command::new(node_path);
-    cmd.arg("openclaw.mjs").args(args).current_dir(openclaw_dir);
+    cmd.arg("openclaw.mjs")
+        .args(args)
+        .current_dir(openclaw_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
 
     #[cfg(windows)]
     {
-        // CREATE_NO_WINDOW = 0x08000000 — hide the console window
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
 
-    if let Some(input) = stdin_data {
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(err) => { eprintln!("[cli] spawn `openclaw {args:?}` failed: {err}"); return None; }
-        };
-        if let Some(mut stdin) = child.stdin.take() {
-            use std::io::Write;
-            let _ = stdin.write_all(input.as_bytes());
-        }
-        match child.wait() {
-            Ok(s) => Some(s),
-            Err(err) => { eprintln!("[cli] wait failed: {err}"); None }
-        }
-    } else {
-        cmd.stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        match cmd.status() {
-            Ok(s) => Some(s),
-            Err(err) => { eprintln!("[cli] run `openclaw {args:?}` failed: {err}"); None }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) => { eprintln!("[cli] spawn `openclaw {args:?}` failed: {err}"); return None; }
+    };
+
+    // Write stdin (if any) and close it so the child doesn't wait for more input.
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(stdin_data.unwrap_or("").as_bytes());
+        // drop(stdin) closes the pipe → EOF for the child
+    }
+
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("[cli] `openclaw {args:?}` timed out after {timeout:?}; killing");
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => { eprintln!("[cli] try_wait failed: {err}"); return None; }
         }
     }
 }
 
-// Ensure ~/.openclaw/openclaw.json exists AND has
-// gateway.controlUi.dangerouslyDisableDeviceAuth=true / allowInsecureAuth=true.
+// Ensure ~/.openclaw/openclaw.json exists with a gateway token and
+// device-auth disabled, so the Tauri webview connects with no pairing prompt.
 //
-// We use OpenClaw's own CLI (`doctor --generate-gateway-token`, `config patch
-// --stdin`) so OpenClaw owns the serialized representation and the Control UI's
-// Raw editor stays available (it disables itself when the config can't safely
-// round-trip raw text).
+// Uses a single `config patch --stdin` (≈1s, non-interactive, raw-roundtrip
+// safe). We deliberately do NOT use `doctor --generate-gateway-token`: it runs
+// slow system-service health checks (~60s) and renders interactive clack UI
+// that hangs in the TTY-less sidecar — that was the "stuck on gateway startup"
+// bug on fresh machines.
 fn ensure_openclaw_config(node_path: &std::path::Path, openclaw_dir: &std::path::Path) {
-    let path = match openclaw_config_path() {
-        Some(p) => p,
-        None => return,
-    };
-
-    let device_auth_ok = config_has_device_auth_disabled();
-    let token_ok = config_has_token();
-    if path.exists() && device_auth_ok && token_ok {
-        return;
+    if config_has_device_auth_disabled() && config_has_token() {
+        return; // warm start — already configured, zero latency
     }
 
-    // First-run case: ask OpenClaw to generate its own gateway token + base config.
-    if !path.exists() || !token_ok {
-        eprintln!("[config] bootstrapping via `openclaw doctor --generate-gateway-token`");
-        let status = run_openclaw_cli(
-            node_path,
-            openclaw_dir,
-            &["doctor", "--generate-gateway-token", "--non-interactive"],
-            None,
-        );
-        if let Some(s) = status {
-            if !s.success() {
-                eprintln!("[config] doctor exited with {s:?}");
-            }
-        }
-    }
-
-    // Apply our device-auth overrides via patch (validated, raw-safe).
-    if !config_has_device_auth_disabled() {
-        eprintln!("[config] patching gateway.controlUi via `openclaw config patch`");
-        let patch = r#"{"gateway":{"controlUi":{"dangerouslyDisableDeviceAuth":true,"allowInsecureAuth":true}}}"#;
-        let status = run_openclaw_cli(node_path, openclaw_dir, &["config", "patch", "--stdin"], Some(patch));
-        if let Some(s) = status {
-            if !s.success() {
-                eprintln!("[config] config patch exited with {s:?}");
-            }
-        }
+    let token = read_gateway_token().unwrap_or_else(|| generate_token_hex(24));
+    let patch = format!(
+        r#"{{"gateway":{{"mode":"local","auth":{{"mode":"token","token":"{token}"}},"port":18789,"bind":"loopback","controlUi":{{"dangerouslyDisableDeviceAuth":true,"allowInsecureAuth":true}}}}}}"#
+    );
+    eprintln!("[config] applying gateway config via `config patch` (non-interactive)");
+    let status = run_openclaw_cli(
+        node_path,
+        openclaw_dir,
+        &["config", "patch", "--stdin"],
+        Some(&patch),
+        Duration::from_secs(60),
+    );
+    match status {
+        Some(s) if s.success() => eprintln!("[config] config patch applied"),
+        Some(s) => eprintln!("[config] config patch exited with {s:?}"),
+        None => eprintln!("[config] config patch failed/timed out — gateway may require manual setup"),
     }
 }
 
@@ -357,7 +365,13 @@ pub fn run() {
                                 let dir = openclaw_for_menu.clone();
                                 std::thread::spawn(move || {
                                     eprintln!("[tray] running `openclaw update --yes` in background…");
-                                    let status = run_openclaw_cli(&node, &dir, &["update", "--yes"], None);
+                                    let status = run_openclaw_cli(
+                                        &node,
+                                        &dir,
+                                        &["update", "--yes"],
+                                        None,
+                                        Duration::from_secs(1800),
+                                    );
                                     eprintln!("[tray] update exited: {status:?}");
                                 });
                             }

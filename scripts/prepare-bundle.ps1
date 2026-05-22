@@ -81,21 +81,24 @@ if (-not (Test-Path $nodeExtractDir)) {
 }
 
 # ---- 4. Assemble resources/ ----
+# NOTE: do NOT bulk Remove-Item the resources dir first — on Windows an
+# antivirus scan or a leftover sidecar can hold a handle on it and make the
+# delete fail. robocopy /MIR below mirrors (adds new, removes stale) per-file
+# with retries, which is robust against transient locks.
 Step "Assemble desktop/src-tauri/resources/"
-if (Test-Path $ResourceDir) { Remove-Item -Recurse -Force $ResourceDir }
-New-Item -ItemType Directory -Path $ResourceDir | Out-Null
+if (-not (Test-Path $ResourceDir)) { New-Item -ItemType Directory -Path $ResourceDir | Out-Null }
 
 # 4a. node/
 $resNodeDir = Join-Path $ResourceDir "node"
-New-Item -ItemType Directory -Path $resNodeDir | Out-Null
-Copy-Item -Path (Join-Path $nodeExtractDir "node.exe") -Destination $resNodeDir
+if (-not (Test-Path $resNodeDir)) { New-Item -ItemType Directory -Path $resNodeDir | Out-Null }
+Copy-Item -Path (Join-Path $nodeExtractDir "node.exe") -Destination $resNodeDir -Force
 Info "Copied node.exe ($([math]::Round((Get-Item (Join-Path $resNodeDir 'node.exe')).Length / 1MB, 1)) MB)"
 
 # 4b. openclaw/ (npm-prebuilt package + its node_modules siblings under openclaw-runtime/node_modules)
 $resOpenClawDir = Join-Path $ResourceDir "openclaw"
 Info "Mirroring openclaw npm runtime (package + deps) ..."
 # Copy the openclaw package itself.
-$null = & robocopy $OpenClawRuntime $resOpenClawDir /MIR /NJH /NJS /NP /NDL /XD .git test __screenshots__ 2>&1
+$null = & robocopy $OpenClawRuntime $resOpenClawDir /MIR /R:2 /W:2 /NJH /NJS /NP /NDL /XD .git test __screenshots__ 2>&1
 if ($LASTEXITCODE -ge 8) { throw "robocopy openclaw failed: $LASTEXITCODE" }
 $global:LASTEXITCODE = 0
 
@@ -104,7 +107,7 @@ $runtimeRoot = Split-Path -Parent (Split-Path -Parent $OpenClawRuntime) # -> ope
 $siblingNodeModules = Join-Path $runtimeRoot "node_modules"
 $destNodeModules = Join-Path $resOpenClawDir "node_modules"
 # Avoid duplicating openclaw inside its own node_modules.
-$null = & robocopy $siblingNodeModules $destNodeModules /MIR /NJH /NJS /NP /NDL /XD openclaw .git 2>&1
+$null = & robocopy $siblingNodeModules $destNodeModules /MIR /R:2 /W:2 /NJH /NJS /NP /NDL /XD openclaw .git 2>&1
 if ($LASTEXITCODE -ge 8) { throw "robocopy node_modules failed: $LASTEXITCODE" }
 $global:LASTEXITCODE = 0
 
