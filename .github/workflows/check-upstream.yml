@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   check:
@@ -23,6 +24,8 @@ jobs:
 
       - name: Check upstream + bump + tag if newer
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -58,3 +61,8 @@ jobs:
           git tag "v$UPSTREAM"
           git push origin HEAD:master
           git push origin "v$UPSTREAM"
+
+          # A tag pushed with GITHUB_TOKEN does NOT trigger build.yml (GitHub
+          # blocks workflow-triggered pushes from starting new workflows to
+          # prevent recursion). So dispatch the build explicitly on the new tag.
+          gh workflow run build.yml --ref "v$UPSTREAM"
