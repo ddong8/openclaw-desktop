@@ -5,8 +5,7 @@ use std::time::Duration;
 use tauri::{Manager, RunEvent};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tokio::process::{Child, Command};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::process::{Child, Command};
 
 const GATEWAY_PORT: u16 = 18789;
 const READINESS_TIMEOUT_SECS: u64 = 300; // OpenClaw cold-start can exceed 60s on first launch
@@ -106,8 +105,10 @@ fn run_openclaw_cli(
         .args(args)
         .current_dir(openclaw_dir)
         .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        // Inherit so `openclaw config patch` errors are visible when launched
+        // from a terminal (helps diagnose first-run config failures).
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
 
     #[cfg(windows)]
     {
@@ -240,8 +241,7 @@ fn spawn_gateway(node_path: &Path, openclaw_dir: &Path) -> std::io::Result<Child
         .arg(GATEWAY_PORT.to_string())
         .current_dir(openclaw_dir)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .stderr(std::process::Stdio::piped());
 
     #[cfg(windows)]
     {
@@ -458,20 +458,22 @@ pub fn run() {
 
             let mut child = spawn_gateway(&node_path, &openclaw_dir)?;
 
-            // Drain stdout / stderr to keep the buffer from filling up and to surface errors.
+            // Drain stdout / stderr on plain OS threads (the child is a
+            // std::process::Child — no Tokio runtime needed; tokio::process on
+            // Unix requires a reactor that isn't present in the setup hook).
             if let Some(stdout) = child.stdout.take() {
-                tauri::async_runtime::spawn(async move {
-                    let mut reader = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        eprintln!("[sidecar:out] {}", line);
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
+                        eprintln!("[sidecar:out] {line}");
                     }
                 });
             }
             if let Some(stderr) = child.stderr.take() {
-                tauri::async_runtime::spawn(async move {
-                    let mut reader = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        eprintln!("[sidecar:err] {}", line);
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                        eprintln!("[sidecar:err] {line}");
                     }
                 });
             }
@@ -577,7 +579,7 @@ pub fn run() {
             if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     if let Some(mut child) = state.sidecar.lock().unwrap().take() {
-                        let _ = child.start_kill();
+                        let _ = child.kill();
                     }
                 }
             }
