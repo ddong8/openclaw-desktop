@@ -49,27 +49,28 @@ cp "$PORT/$PKG/bin/node" "$RES/node/node"
 chmod +x "$RES/node/node"
 echo "    node: $(du -m "$RES/node/node" | cut -f1) MB"
 
-# Copy openclaw npm package itself (no top-level /node_modules — that's the
-# hoisted-deps tree, copied separately below). Anchored excludes only.
+# Copy the openclaw package — including any bundled node_modules inside it.
+# (openclaw 2026.5.22 ships npm-shrinkwrap.json in its tarball, which makes
+# npm install most deps INSIDE openclaw/node_modules/ rather than hoisting them
+# to the top-level openclaw-runtime2/node_modules/ — so the bulk of runtime
+# deps actually rides on this first rsync, NOT the second.)
 rsync -a \
-  --exclude='/node_modules' \
   --exclude='/.git' \
   --exclude='/test' \
   --exclude='/__screenshots__' \
   "$RUNTIME/" "$RES/openclaw/"
-echo "    openclaw package copied ($(du -sm "$RES/openclaw" | cut -f1) MB)"
+echo "    openclaw package copied ($(du -sm "$RES/openclaw" | cut -f1) MB), node_modules entries inside: $(ls "$RES/openclaw/node_modules" 2>/dev/null | wc -l | tr -d ' ')"
 
-# Copy hoisted deps. Use an ANCHORED exclude ('/openclaw') so we only skip the
-# top-level openclaw package (already copied above), not nested 'openclaw'
-# basenames inside other deps (tokenjuice has hosts/openclaw/, rules/openclaw/,
-# rules/fixtures/openclaw/ — an unanchored 'openclaw' exclude collides with
-# --delete on macOS BSD rsync and ends up nuking the entire transfer.)
+# Merge in anything hoisted to the top level (older openclaw versions hoist;
+# newer ones bundle). No --delete: we want UNION of both layouts, not replace.
+# Anchored exclude /openclaw so we don't recurse into the openclaw package
+# itself (it's already at $RES/openclaw, not under node_modules).
 mkdir -p "$RES/openclaw/node_modules"
-rsync -a \
+rsync -a --ignore-existing \
   --exclude='/openclaw' \
   --exclude='/.git' \
   "$RUNTIME_ROOT/node_modules/" "$RES/openclaw/node_modules/"
-echo "    hoisted deps copied ($(ls "$RES/openclaw/node_modules" | wc -l | tr -d ' ') entries)"
+echo "    after hoisted merge: $(ls "$RES/openclaw/node_modules" | wc -l | tr -d ' ') entries in node_modules/"
 
 # Verify the critical runtime deps actually landed. If json5 is missing the
 # embedded Node will crash with ERR_MODULE_NOT_FOUND on first `config patch`

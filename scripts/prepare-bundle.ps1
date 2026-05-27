@@ -94,22 +94,41 @@ if (-not (Test-Path $resNodeDir)) { New-Item -ItemType Directory -Path $resNodeD
 Copy-Item -Path (Join-Path $nodeExtractDir "node.exe") -Destination $resNodeDir -Force
 Info "Copied node.exe ($([math]::Round((Get-Item (Join-Path $resNodeDir 'node.exe')).Length / 1MB, 1)) MB)"
 
-# 4b. openclaw/ (npm-prebuilt package + its node_modules siblings under openclaw-runtime/node_modules)
+# 4b. openclaw/ (npm package + its deps — layout depends on whether openclaw
+#     ships npm-shrinkwrap.json: with shrinkwrap deps are BUNDLED inside
+#     openclaw/node_modules/, without shrinkwrap deps are HOISTED to top-level
+#     openclaw-runtime2/node_modules/. We take the UNION of both layouts.)
 $resOpenClawDir = Join-Path $ResourceDir "openclaw"
 Info "Mirroring openclaw npm runtime (package + deps) ..."
-# Copy the openclaw package itself.
-$null = & robocopy $OpenClawRuntime $resOpenClawDir /MIR /R:2 /W:2 /NJH /NJS /NP /NDL /XD .git test __screenshots__ 2>&1
+# Pre-clean dest so stale state doesn't survive into the new build.
+if (Test-Path $resOpenClawDir) {
+  Remove-Item -Recurse -Force $resOpenClawDir -ErrorAction SilentlyContinue
+}
+
+# Copy the openclaw package (incl. any bundled node_modules inside it). NO /MIR
+# on the 2nd pass below, so we can layer hoisted deps on top non-destructively.
+$null = & robocopy $OpenClawRuntime $resOpenClawDir /E /R:2 /W:2 /NJH /NJS /NP /NDL /XD .git test __screenshots__ 2>&1
 if ($LASTEXITCODE -ge 8) { throw "robocopy openclaw failed: $LASTEXITCODE" }
 $global:LASTEXITCODE = 0
+$bundledCount = 0
+$bundledNodeModules = Join-Path $resOpenClawDir "node_modules"
+if (Test-Path $bundledNodeModules) {
+  $bundledCount = (Get-ChildItem $bundledNodeModules -Force | Measure-Object).Count
+}
+Info "openclaw package copied — $bundledCount entries already inside node_modules/ (bundled)"
 
-# Copy the sibling node_modules (npm hoists deps to the top-level node_modules).
-$runtimeRoot = Split-Path -Parent (Split-Path -Parent $OpenClawRuntime) # -> openclaw-runtime/
+# Layer top-level hoisted deps onto whatever was bundled. /XC /XN /XO together
+# mean "don't overwrite files that already exist in dest" (no robocopy flag is
+# directly equivalent to rsync's --ignore-existing — this combination is).
+$runtimeRoot = Split-Path -Parent (Split-Path -Parent $OpenClawRuntime)
 $siblingNodeModules = Join-Path $runtimeRoot "node_modules"
 $destNodeModules = Join-Path $resOpenClawDir "node_modules"
-# Avoid duplicating openclaw inside its own node_modules.
-$null = & robocopy $siblingNodeModules $destNodeModules /MIR /R:2 /W:2 /NJH /NJS /NP /NDL /XD openclaw .git 2>&1
+if (-not (Test-Path $destNodeModules)) { New-Item -ItemType Directory -Path $destNodeModules | Out-Null }
+$null = & robocopy $siblingNodeModules $destNodeModules /E /R:2 /W:2 /NJH /NJS /NP /NDL /XC /XN /XO /XD openclaw .git 2>&1
 if ($LASTEXITCODE -ge 8) { throw "robocopy node_modules failed: $LASTEXITCODE" }
 $global:LASTEXITCODE = 0
+$totalCount = (Get-ChildItem $destNodeModules -Force | Measure-Object).Count
+Info "after hoisted merge: $totalCount entries in node_modules/"
 
 # Strip compile-time-only files: TypeScript declarations + sourcemaps.
 # Node never loads these at runtime, so this is NOT a feature cut (no .js removed).
