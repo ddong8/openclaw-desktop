@@ -24,6 +24,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 log = "0.4"
 getrandom = "0.2"
+# PTY for the "Sign in to provider" mini-terminal window. `openclaw models auth
+# login` checks process.stdin.isTTY at the top and bails out on a plain pipe,
+# so OAuth flows must run under a pseudo-terminal.
+portable-pty = "0.9"
 
 [profile.release]
 panic = "abort"

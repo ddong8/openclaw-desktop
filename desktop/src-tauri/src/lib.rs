@@ -2,24 +2,232 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use tauri::{Manager, RunEvent};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use std::process::{Child, Command};
+use std::io::{Read, Write};
 
 const GATEWAY_PORT: u16 = 18789;
 const READINESS_TIMEOUT_SECS: u64 = 300; // OpenClaw cold-start can exceed 60s on first launch
 const READINESS_POLL_MS: u64 = 500;
 
+// Providers we expose in the tray "Sign in" submenu. Each entry pairs a CLI
+// `--provider` id (passed straight to `openclaw models auth login`) with the
+// human-readable label shown in the menu. OAuth-only providers go first; the
+// list is intentionally short so the menu stays browsable — the user can pick
+// "其他 provider…" to enter a custom id.
+const OAUTH_PROVIDERS: &[(&str, &str)] = &[
+    ("google-gemini-cli", "Google Gemini (CLI OAuth)"),
+    ("openai-codex",      "OpenAI Codex (OAuth)"),
+    ("claude-max",        "Claude Max (API proxy login)"),
+    ("github-copilot",    "GitHub Copilot"),
+    ("anthropic",         "Anthropic (API key / token)"),
+    ("openai",            "OpenAI (API key)"),
+];
+
+struct PtySession {
+    writer: Box<dyn Write + Send>,
+    master: Box<dyn portable_pty::MasterPty + Send>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+}
+
 #[derive(Default)]
 struct AppState {
     sidecar: Mutex<Option<Child>>,
     port: Mutex<Option<u16>>,
+    pty: Mutex<Option<PtySession>>,
+    // Cached for spawn_login_pty so it doesn't have to redo path resolution.
+    node_path: Mutex<Option<PathBuf>>,
+    openclaw_dir: Mutex<Option<PathBuf>>,
 }
 
 #[tauri::command]
 fn get_api_port(state: tauri::State<AppState>) -> Option<u16> {
     *state.port.lock().unwrap()
+}
+
+// ============================================================================
+// PTY-backed "Sign in to provider" mini-terminal
+//
+// `openclaw models auth login` checks `process.stdin.isTTY` at the top of the
+// command and exits with "requires an interactive TTY" on a plain pipe. To run
+// OAuth flows (google-gemini-cli, openai-codex, claude-max, …) from our shell
+// we allocate a real pseudo-terminal via portable-pty and bridge it to an
+// xterm.js window. The window's terminal.js calls these commands.
+// ============================================================================
+
+#[tauri::command]
+fn pty_start(
+    provider: String,
+    rows: u16,
+    cols: u16,
+    app: AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    // One PTY at a time. Kill any previous session before starting a new one.
+    if let Some(prev) = state.pty.lock().unwrap().take() {
+        let mut killer = prev.killer;
+        let _ = killer.kill();
+        drop(prev.writer);
+        drop(prev.master);
+    }
+
+    let node_path = state.node_path.lock().unwrap().clone()
+        .ok_or_else(|| "node path not initialized".to_string())?;
+    let openclaw_dir = state.openclaw_dir.lock().unwrap().clone()
+        .ok_or_else(|| "openclaw dir not initialized".to_string())?;
+
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| format!("openpty failed: {e}"))?;
+
+    let mut cmd = portable_pty::CommandBuilder::new(&node_path);
+    cmd.arg("openclaw.mjs");
+    cmd.arg("models");
+    cmd.arg("auth");
+    cmd.arg("login");
+    cmd.arg("--provider");
+    cmd.arg(&provider);
+    cmd.cwd(&openclaw_dir);
+    // openclaw's clack prompter renders with truecolor + box-drawing chars; tell
+    // node that stdout is a real terminal.
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("FORCE_COLOR", "1");
+
+    let mut child = pair.slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    // Close the slave handle on our side — the child still has it.
+    drop(pair.slave);
+
+    let reader = pair.master
+        .try_clone_reader()
+        .map_err(|e| format!("clone reader failed: {e}"))?;
+    let writer = pair.master
+        .take_writer()
+        .map_err(|e| format!("take writer failed: {e}"))?;
+    let killer = child.clone_killer();
+
+    // Pump PTY -> Tauri events. The reader yields whatever bytes the child
+    // wrote (ANSI escapes included); xterm.js handles rendering them.
+    {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF: child closed stdout
+                    Ok(n) => {
+                        // Use lossy conversion — clack output is utf-8 but a
+                        // chunk may split a multi-byte char; lossy replaces
+                        // the partial with U+FFFD which xterm renders fine.
+                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        if app.emit("pty://output", serde_json::json!({ "data": chunk })).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
+    // Wait for child exit on a separate thread, then notify the window.
+    {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let code = match status {
+                Ok(s) => s.exit_code() as i64,
+                Err(_) => -1,
+            };
+            let _ = app.emit("pty://exit", serde_json::json!({ "code": code }));
+        });
+    }
+
+    state.pty.lock().unwrap().replace(PtySession { writer, master: pair.master, killer });
+    eprintln!("[pty] started openclaw models auth login --provider {provider}");
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_input(input: String, state: tauri::State<AppState>) -> Result<(), String> {
+    let mut guard = state.pty.lock().unwrap();
+    let session = guard.as_mut().ok_or_else(|| "no active pty session".to_string())?;
+    session.writer
+        .write_all(input.as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
+    session.writer.flush().map_err(|e| format!("flush failed: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_resize(rows: u16, cols: u16, state: tauri::State<AppState>) -> Result<(), String> {
+    let guard = state.pty.lock().unwrap();
+    let Some(session) = guard.as_ref() else { return Ok(()); };
+    session.master
+        .resize(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| format!("resize failed: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn pty_close(state: tauri::State<AppState>) -> Result<(), String> {
+    let Some(prev) = state.pty.lock().unwrap().take() else { return Ok(()); };
+    let mut killer = prev.killer;
+    let _ = killer.kill();
+    drop(prev.writer);
+    drop(prev.master);
+    Ok(())
+}
+
+fn open_login_terminal_window(app: &AppHandle, provider: &str) -> Result<(), tauri::Error> {
+    // Reuse a single window across providers — closing the old one first kills
+    // the old PTY too (via on_window_event below).
+    if let Some(existing) = app.get_webview_window("login-terminal") {
+        let _ = existing.close();
+    }
+    // Fragment over query string: Tauri's WebviewUrl::App treats the path as
+    // a PathBuf and some backends strip the query, but fragments ride through
+    // intact since they're never sent in the HTTP request line.
+    let url = format!("terminal/index.html#{}", urlencoding_simple(provider));
+    let app_for_close = app.clone();
+    WebviewWindowBuilder::new(app, "login-terminal", WebviewUrl::App(url.into()))
+        .title(format!("OpenClaw — Sign in to {provider}"))
+        .inner_size(820.0, 520.0)
+        .min_inner_size(640.0, 360.0)
+        .resizable(true)
+        .build()?;
+    // When the window is closed by the user, drop the PTY so the openclaw
+    // subprocess doesn't linger.
+    if let Some(w) = app.get_webview_window("login-terminal") {
+        w.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed) {
+                if let Some(state) = app_for_close.try_state::<AppState>() {
+                    if let Some(prev) = state.pty.lock().unwrap().take() {
+                        let mut killer = prev.killer;
+                        let _ = killer.kill();
+                        drop(prev.writer);
+                        drop(prev.master);
+                    }
+                }
+            }
+        });
+    }
+    Ok(())
+}
+
+// Minimal URL encoder for provider ids (alphanumeric + '-'). All current
+// OAuth provider ids are safe ASCII so this avoids pulling in a urlencoding
+// crate just for one short string.
+fn urlencoding_simple(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c.to_string() } else { format!("%{:02X}", c as u32) })
+        .collect()
 }
 
 // Read OpenClaw's npm package version from <openclaw_dir>/package.json so the
@@ -337,7 +545,13 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(AppState::default())
-        .invoke_handler(tauri::generate_handler![get_api_port])
+        .invoke_handler(tauri::generate_handler![
+            get_api_port,
+            pty_start,
+            pty_input,
+            pty_resize,
+            pty_close,
+        ])
         .on_window_event(|window, event| {
             // Hide the window on close instead of quitting — the embedded
             // OpenClaw gateway must stay running so channel webhooks
@@ -363,14 +577,44 @@ pub fn run() {
 
             ensure_openclaw_config(&node_path, &openclaw_dir);
 
+            // Cache for pty_start to spawn the openclaw subprocess without
+            // re-doing path resolution.
+            {
+                let state = app_handle.state::<AppState>();
+                *state.node_path.lock().unwrap() = Some(node_path.clone());
+                *state.openclaw_dir.lock().unwrap() = Some(openclaw_dir.clone());
+            }
+
             // ---- Tray icon + menu ----
             {
                 let oc_version = read_openclaw_version(&openclaw_dir);
                 let shell_version = env!("CARGO_PKG_VERSION");
                 let about_label = format!("OpenClaw v{oc_version} (shell {shell_version})");
 
+                // Per-provider sign-in submenu. Each item id is "login:<provider>"
+                // so the click handler can route on prefix.
+                let mut provider_items: Vec<MenuItem<_>> = Vec::with_capacity(OAUTH_PROVIDERS.len());
+                for (id, label) in OAUTH_PROVIDERS {
+                    provider_items.push(MenuItem::with_id(
+                        app,
+                        format!("login:{id}"),
+                        *label,
+                        true,
+                        None::<&str>,
+                    )?);
+                }
+                let login_submenu = Submenu::with_id_and_items(
+                    app,
+                    "login_menu",
+                    "登录 provider…",
+                    true,
+                    &provider_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<_>).collect::<Vec<_>>(),
+                )?;
+
                 let menu = Menu::with_items(app, &[
                     &MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &login_submenu,
                     &PredefinedMenuItem::separator(app)?,
                     &MenuItem::with_id(app, "open_config", "打开配置文件", true, None::<&str>)?,
                     &MenuItem::with_id(app, "open_data", "打开配置目录", true, None::<&str>)?,
@@ -444,6 +688,12 @@ pub fn run() {
                             }
                             "quit" => {
                                 app.exit(0);
+                            }
+                            other if other.starts_with("login:") => {
+                                let provider = &other["login:".len()..];
+                                if let Err(err) = open_login_terminal_window(app, provider) {
+                                    eprintln!("[tray] open login terminal failed: {err}");
+                                }
                             }
                             _ => {}
                         }
@@ -580,6 +830,12 @@ pub fn run() {
                 if let Some(state) = app_handle.try_state::<AppState>() {
                     if let Some(mut child) = state.sidecar.lock().unwrap().take() {
                         let _ = child.kill();
+                    }
+                    if let Some(pty) = state.pty.lock().unwrap().take() {
+                        let mut killer = pty.killer;
+                        let _ = killer.kill();
+                        drop(pty.writer);
+                        drop(pty.master);
                     }
                 }
             }

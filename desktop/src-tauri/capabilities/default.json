@@ -2,8 +2,8 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Default permissions for the OpenClaw desktop shell window. Applies to both the tauri:// splash and the http://127.0.0.1:18789 Control UI origin so injected hooks can forward external links via tauri-plugin-opener.",
-  "windows": ["main"],
-  "webviews": ["main"],
+  "windows": ["main", "login-terminal"],
+  "webviews": ["main", "login-terminal"],
   "remote": {
     "urls": [
       "http://127.0.0.1:18789/*",
