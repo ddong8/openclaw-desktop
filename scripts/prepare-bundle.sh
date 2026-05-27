@@ -40,14 +40,49 @@ if [ ! -d "$PKG" ]; then
 fi
 
 echo "==> Assemble $RES"
+# Start from a clean slate so stale state from a partial previous run can't
+# poison rsync's --delete pass (this bit us on macOS BSD rsync, which left the
+# 2nd-rsync dest with only tokenjuice/ + .package-lock.json).
+rm -rf "$RES/node" "$RES/openclaw"
 mkdir -p "$RES/node"
 cp "$PORT/$PKG/bin/node" "$RES/node/node"
 chmod +x "$RES/node/node"
 echo "    node: $(du -m "$RES/node/node" | cut -f1) MB"
 
-# openclaw package + its hoisted sibling deps (npm flat layout)
-rsync -a --delete --exclude='.git' --exclude='test' --exclude='__screenshots__' "$RUNTIME/" "$RES/openclaw/"
-rsync -a --delete --exclude='openclaw' --exclude='.git' "$RUNTIME_ROOT/node_modules/" "$RES/openclaw/node_modules/"
+# Copy openclaw npm package itself (no top-level /node_modules — that's the
+# hoisted-deps tree, copied separately below). Anchored excludes only.
+rsync -a \
+  --exclude='/node_modules' \
+  --exclude='/.git' \
+  --exclude='/test' \
+  --exclude='/__screenshots__' \
+  "$RUNTIME/" "$RES/openclaw/"
+echo "    openclaw package copied ($(du -sm "$RES/openclaw" | cut -f1) MB)"
+
+# Copy hoisted deps. Use an ANCHORED exclude ('/openclaw') so we only skip the
+# top-level openclaw package (already copied above), not nested 'openclaw'
+# basenames inside other deps (tokenjuice has hosts/openclaw/, rules/openclaw/,
+# rules/fixtures/openclaw/ — an unanchored 'openclaw' exclude collides with
+# --delete on macOS BSD rsync and ends up nuking the entire transfer.)
+mkdir -p "$RES/openclaw/node_modules"
+rsync -a \
+  --exclude='/openclaw' \
+  --exclude='/.git' \
+  "$RUNTIME_ROOT/node_modules/" "$RES/openclaw/node_modules/"
+echo "    hoisted deps copied ($(ls "$RES/openclaw/node_modules" | wc -l | tr -d ' ') entries)"
+
+# Verify the critical runtime deps actually landed. If json5 is missing the
+# embedded Node will crash with ERR_MODULE_NOT_FOUND on first `config patch`
+# call — fail the build loudly here instead of shipping a broken bundle.
+for dep in json5 tokenjuice @mistralai/mistralai; do
+  if [ ! -d "$RES/openclaw/node_modules/$dep" ]; then
+    echo "ERROR: required dep '$dep' missing from $RES/openclaw/node_modules/"
+    echo "       top-level node_modules entries actually present:"
+    ls "$RES/openclaw/node_modules/" | sed 's/^/         /'
+    exit 1
+  fi
+done
+echo "    verified critical deps: json5, tokenjuice, @mistralai/mistralai"
 
 # Strip compile-time-only files (TS decls + sourcemaps). Node never loads these
 # at runtime — not a feature cut — and it shortens deep SDK paths for Windows.

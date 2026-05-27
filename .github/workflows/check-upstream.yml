@@ -45,8 +45,21 @@ jobs:
           CURRENT="$(node -p "require('./desktop/src-tauri/tauri.conf.json').version")"
           echo "current app version: $CURRENT"
 
-          if [ "$UPSTREAM" = "$CURRENT" ]; then
-            echo "already up to date ($UPSTREAM) — nothing to do"
+          # Strict semver compare so we never DOWNGRADE — if we shipped a
+          # bundle-fix release (e.g. 2026.5.23) ahead of upstream catching up,
+          # treat upstream as up-to-date until it goes strictly higher.
+          NEWER="$(node -e "
+            const a='$UPSTREAM'.split('.').map(Number);
+            const b='$CURRENT'.split('.').map(Number);
+            for (let i=0;i<Math.max(a.length,b.length);i++){
+              const x=a[i]??0, y=b[i]??0;
+              if (x>y) { console.log('yes'); process.exit(0); }
+              if (x<y) { console.log('no');  process.exit(0); }
+            }
+            console.log('no');
+          ")"
+          if [ "$NEWER" != "yes" ]; then
+            echo "upstream ($UPSTREAM) is not newer than current ($CURRENT) — nothing to do"
             exit 0
           fi
 

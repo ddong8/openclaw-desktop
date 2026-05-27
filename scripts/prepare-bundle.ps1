@@ -129,4 +129,17 @@ Get-ChildItem $resOpenClawDir -Recurse -Directory -Filter "@mistralai" -ErrorAct
 $sizeMb = [math]::Round((Get-ChildItem $resOpenClawDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
 Info "openclaw/ runtime bundle size: $sizeMb MB"
 
+# Defense in depth: confirm the critical runtime deps actually landed. If json5
+# is missing the embedded Node will crash with ERR_MODULE_NOT_FOUND on first
+# `config patch` call. Fail the build loudly here, not silently in the .exe.
+foreach ($dep in @("json5", "tokenjuice", "@mistralai/mistralai")) {
+  $depPath = Join-Path $resOpenClawDir "node_modules/$dep"
+  if (-not (Test-Path $depPath)) {
+    Write-Host "ERROR: required dep '$dep' missing from $resOpenClawDir/node_modules/" -ForegroundColor Red
+    Get-ChildItem (Join-Path $resOpenClawDir "node_modules") | Select-Object -First 30 | ForEach-Object { Write-Host "  $_" }
+    throw "bundle verification failed"
+  }
+}
+Info "verified critical deps: json5, tokenjuice, @mistralai/mistralai"
+
 Step "Done. Next: cd desktop && pnpm tauri build"
