@@ -85,6 +85,19 @@ for dep in json5 tokenjuice @mistralai/mistralai; do
 done
 echo "    verified critical deps: json5, tokenjuice, @mistralai/mistralai"
 
+# Drop dangling symlinks. npm creates node_modules/.bin/openclaw → ../openclaw/openclaw.mjs
+# which resolves to <bundle>/node_modules/openclaw/openclaw.mjs — a path we don't
+# ship (openclaw package lives one level up at <bundle>/openclaw/). Tauri's Rust
+# resource manifest rejects dangling symlinks with "resource path doesn't exist"
+# and fails the build. Our embedded Node spawns openclaw.mjs directly, never via
+# .bin/, so dropping these is harmless.
+echo "==> Drop dangling symlinks (Tauri can't bundle them)"
+find "$RES/openclaw" -type l 2>/dev/null | while read -r link; do
+  if [ ! -e "$link" ]; then
+    rm -f "$link"
+  fi
+done
+
 # Strip compile-time-only files (TS decls + sourcemaps). Node never loads these
 # at runtime — not a feature cut — and it shortens deep SDK paths for Windows.
 echo "==> Strip .d.ts / .map (compile-time only; runtime unaffected)"
