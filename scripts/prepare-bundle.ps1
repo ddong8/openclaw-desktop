@@ -94,6 +94,30 @@ if (-not (Test-Path $resNodeDir)) { New-Item -ItemType Directory -Path $resNodeD
 Copy-Item -Path (Join-Path $nodeExtractDir "node.exe") -Destination $resNodeDir -Force
 Info "Copied node.exe ($([math]::Round((Get-Item (Join-Path $resNodeDir 'node.exe')).Length / 1MB, 1)) MB)"
 
+# Bundle npm CLI + shell wrappers. Without these, openclaw's npm-runner falls
+# back to the user's system npm (or throws on Windows where there's no
+# fallback) — observed failure was @openai/codex installing without its
+# darwin-arm64 native binary. See scripts/prepare-bundle.sh for the full
+# rationale.
+$npmSrc = Join-Path $nodeExtractDir "node_modules\npm"
+$npmDest = Join-Path $resNodeDir "node_modules\npm"
+if (Test-Path $npmSrc) {
+  if (-not (Test-Path (Join-Path $resNodeDir "node_modules"))) {
+    New-Item -ItemType Directory -Path (Join-Path $resNodeDir "node_modules") | Out-Null
+  }
+  $null = & robocopy $npmSrc $npmDest /E /R:2 /W:2 /NJH /NJS /NP /NDL 2>&1
+  if ($LASTEXITCODE -ge 8) { throw "robocopy npm failed: $LASTEXITCODE" }
+  $global:LASTEXITCODE = 0
+  $npmMb = [math]::Round((Get-ChildItem $npmDest -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
+  Info "Copied npm CLI ($npmMb MB)"
+}
+foreach ($f in @("npm", "npm.cmd", "npm.ps1", "npx", "npx.cmd", "npx.ps1")) {
+  $src = Join-Path $nodeExtractDir $f
+  if (Test-Path $src) {
+    Copy-Item -Path $src -Destination $resNodeDir -Force
+  }
+}
+
 # 4b. openclaw/ (npm package + its deps — layout depends on whether openclaw
 #     ships npm-shrinkwrap.json: with shrinkwrap deps are BUNDLED inside
 #     openclaw/node_modules/, without shrinkwrap deps are HOISTED to top-level

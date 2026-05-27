@@ -49,6 +49,19 @@ cp "$PORT/$PKG/bin/node" "$RES/node/node"
 chmod +x "$RES/node/node"
 echo "    node: $(du -m "$RES/node/node" | cut -f1) MB"
 
+# Bundle npm CLI alongside node. Without this, openclaw's plugin installer
+# (scripts/npm-runner.mjs) can't find a toolchain-local npm and falls back to
+# the user's system npm (which may be missing or quirky) — observed failure:
+# `@openai/codex` installed without its `@openai/codex-darwin-arm64` optional
+# native binary, then `codex app-server` crashes at launch with
+# "Missing optional dependency". Layout we use is the Windows tarball's
+# (node_modules/npm/ next to the node binary) because openclaw's resolver
+# checks `<nodeDir>/node_modules/npm/bin/npm-cli.js` as a fallback path that
+# works on all platforms.
+mkdir -p "$RES/node/node_modules"
+rsync -a "$PORT/$PKG/lib/node_modules/npm/" "$RES/node/node_modules/npm/"
+echo "    npm: $(du -sm "$RES/node/node_modules/npm" | cut -f1) MB"
+
 # Copy the openclaw package — including any bundled node_modules inside it.
 # (openclaw 2026.5.22 ships npm-shrinkwrap.json in its tarball, which makes
 # npm install most deps INSIDE openclaw/node_modules/ rather than hoisting them
