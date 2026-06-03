@@ -85,10 +85,13 @@ rsync -a --ignore-existing \
   "$RUNTIME_ROOT/node_modules/" "$RES/openclaw/node_modules/"
 echo "    after hoisted merge: $(ls "$RES/openclaw/node_modules" | wc -l | tr -d ' ') entries in node_modules/"
 
-# Verify the critical runtime deps actually landed. If json5 is missing the
-# embedded Node will crash with ERR_MODULE_NOT_FOUND on first `config patch`
-# call — fail the build loudly here instead of shipping a broken bundle.
-for dep in json5 tokenjuice @mistralai/mistralai; do
+# Verify the critical runtime deps actually landed. json5 is the canary that
+# crashed mac builds in v2026.5.22 (ERR_MODULE_NOT_FOUND from dist/redact-*.js
+# on first `config patch` call) — if it's missing the bundle is broken.
+# Don't list other deps here: upstream openclaw's dep set changes between
+# releases (2026.5.28 dropped tokenjuice, etc.) and a hardcoded list rots into
+# false-positive build failures.
+for dep in json5; do
   if [ ! -d "$RES/openclaw/node_modules/$dep" ]; then
     echo "ERROR: required dep '$dep' missing from $RES/openclaw/node_modules/"
     echo "       top-level node_modules entries actually present:"
@@ -96,7 +99,7 @@ for dep in json5 tokenjuice @mistralai/mistralai; do
     exit 1
   fi
 done
-echo "    verified critical deps: json5, tokenjuice, @mistralai/mistralai"
+echo "    verified canary dep: json5 present"
 
 # Drop dangling symlinks. npm creates node_modules/.bin/openclaw → ../openclaw/openclaw.mjs
 # which resolves to <bundle>/node_modules/openclaw/openclaw.mjs — a path we don't

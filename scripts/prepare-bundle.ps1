@@ -172,10 +172,12 @@ Get-ChildItem $resOpenClawDir -Recurse -Directory -Filter "@mistralai" -ErrorAct
 $sizeMb = [math]::Round((Get-ChildItem $resOpenClawDir -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB, 1)
 Info "openclaw/ runtime bundle size: $sizeMb MB"
 
-# Defense in depth: confirm the critical runtime deps actually landed. If json5
-# is missing the embedded Node will crash with ERR_MODULE_NOT_FOUND on first
-# `config patch` call. Fail the build loudly here, not silently in the .exe.
-foreach ($dep in @("json5", "tokenjuice", "@mistralai/mistralai")) {
+# Defense in depth: json5 is the canary that crashed mac builds in v2026.5.22
+# (ERR_MODULE_NOT_FOUND from dist/redact-*.js). If it's missing the bundle is
+# broken. Don't list other deps: upstream openclaw's dep set changes between
+# releases (2026.5.28 dropped tokenjuice) and a hardcoded list rots into
+# false-positive build failures.
+foreach ($dep in @("json5")) {
   $depPath = Join-Path $resOpenClawDir "node_modules/$dep"
   if (-not (Test-Path $depPath)) {
     Write-Host "ERROR: required dep '$dep' missing from $resOpenClawDir/node_modules/" -ForegroundColor Red
@@ -183,6 +185,6 @@ foreach ($dep in @("json5", "tokenjuice", "@mistralai/mistralai")) {
     throw "bundle verification failed"
   }
 }
-Info "verified critical deps: json5, tokenjuice, @mistralai/mistralai"
+Info "verified canary dep: json5 present"
 
 Step "Done. Next: cd desktop && pnpm tauri build"
