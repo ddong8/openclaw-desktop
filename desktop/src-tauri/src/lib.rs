@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder};
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use std::process::{Child, Command};
 use std::io::{Read, Write};
@@ -12,20 +12,15 @@ const GATEWAY_PORT: u16 = 18789;
 const READINESS_TIMEOUT_SECS: u64 = 300; // OpenClaw cold-start can exceed 60s on first launch
 const READINESS_POLL_MS: u64 = 500;
 
-// Auth choices we expose in the tray "登录 provider…" submenu. The id is the
-// canonical `--auth-choice` value for `openclaw onboard` — onboard handles the
-// full chain (install the provider plugin if missing → run the OAuth/device-code
-// flow → write auth-profiles.json), whereas `models auth login --provider …`
-// assumes the plugin is already installed and 404s with "No provider plugins
-// found" on a fresh ~/.openclaw/. Pure-API-key flows aren't here because the
-// Control UI's Settings → Authentication already covers them.
-const OAUTH_PROVIDERS: &[(&str, &str)] = &[
-    ("claude-cli",          "Claude (Claude.ai login)"),
-    ("openai-codex",        "OpenAI Codex (OAuth)"),
-    ("openai-device-code",  "OpenAI (device code)"),
-    ("google-gemini-cli",   "Google Gemini (CLI OAuth)"),
-    ("github-copilot",      "GitHub Copilot"),
-    ("xai-oauth",           "xAI / Grok (OAuth)"),
+// Background-prefetch list — when the gateway is ready, we install these
+// OAuth provider plugins so the user's first `openclaw onboard --auth-choice <X>`
+// in the terminal skips the 10-30s plugin-install step. The tray submenu that
+// used to mirror this list was removed in v2026.6.10 because the openclaw
+// shell can run the same `onboard` command directly without curated entries.
+const PREFETCH_PROVIDERS: &[&str] = &[
+    "openai-codex",
+    "google-gemini-cli",
+    "claude-cli",
 ];
 
 struct PtySession {
@@ -807,11 +802,8 @@ impl PhaseRecognizer {
 // running on every launch is cheap after first-time setup. Emits
 // "prefetch://progress" events the tray tooltip listens for.
 fn prefetch_oauth_plugins(node_path: &Path, openclaw_dir: &Path, app: &AppHandle) {
-    // Subset of OAUTH_PROVIDERS — the three most-common first-login picks.
-    // Doing all six would waste ~150 MB of bandwidth on most users.
-    const PREFETCH: &[&str] = &["openai-codex", "google-gemini-cli", "claude-cli"];
-    let total = PREFETCH.len();
-    for (idx, choice) in PREFETCH.iter().enumerate() {
+    let total = PREFETCH_PROVIDERS.len();
+    for (idx, choice) in PREFETCH_PROVIDERS.iter().enumerate() {
         let _ = app.emit(
             "prefetch://progress",
             serde_json::json!({ "provider": choice, "idx": idx + 1, "total": total, "stage": "installing" }),
@@ -1042,30 +1034,10 @@ pub fn run() {
                 let shell_version = env!("CARGO_PKG_VERSION");
                 let about_label = format!("OpenClaw v{oc_version} (shell {shell_version})");
 
-                // Per-provider sign-in submenu. Each item id is "login:<provider>"
-                // so the click handler can route on prefix.
-                let mut provider_items: Vec<MenuItem<_>> = Vec::with_capacity(OAUTH_PROVIDERS.len());
-                for (id, label) in OAUTH_PROVIDERS {
-                    provider_items.push(MenuItem::with_id(
-                        app,
-                        format!("login:{id}"),
-                        *label,
-                        true,
-                        None::<&str>,
-                    )?);
-                }
-                let login_submenu = Submenu::with_id_and_items(
-                    app,
-                    "login_menu",
-                    "登录 provider…",
-                    true,
-                    &provider_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<_>).collect::<Vec<_>>(),
-                )?;
-
                 // 托盘左键已经是"显示主窗口",所以不再放重复的 "显示窗口" 菜单项。
-                // 三个功能区:openclaw 子命令(登录 / 终端)→ 配置入口 → 生命周期 → 信息。
+                // OAuth 登录 provider 的子菜单也撤了——用户在 openclaw 终端里
+                // 直接 `openclaw onboard --auth-choice <X>` 等价,菜单冗余。
                 let menu = Menu::with_items(app, &[
-                    &login_submenu,
                     &MenuItem::with_id(app, "open_shell", "打开 openclaw 终端", true, None::<&str>)?,
                     &PredefinedMenuItem::separator(app)?,
                     &MenuItem::with_id(app, "open_config", "打开配置文件", true, None::<&str>)?,
@@ -1138,12 +1110,6 @@ pub fn run() {
                             }
                             "quit" => {
                                 app.exit(0);
-                            }
-                            other if other.starts_with("login:") => {
-                                let provider = &other["login:".len()..];
-                                if let Err(err) = open_login_terminal_window(app, provider) {
-                                    eprintln!("[tray] open login terminal failed: {err}");
-                                }
                             }
                             _ => {}
                         }
