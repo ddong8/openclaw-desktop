@@ -12,18 +12,20 @@ const GATEWAY_PORT: u16 = 18789;
 const READINESS_TIMEOUT_SECS: u64 = 300; // OpenClaw cold-start can exceed 60s on first launch
 const READINESS_POLL_MS: u64 = 500;
 
-// Providers we expose in the tray "Sign in" submenu. Each entry pairs a CLI
-// `--provider` id (passed straight to `openclaw models auth login`) with the
-// human-readable label shown in the menu. OAuth-only providers go first; the
-// list is intentionally short so the menu stays browsable — the user can pick
-// "其他 provider…" to enter a custom id.
+// Auth choices we expose in the tray "登录 provider…" submenu. The id is the
+// canonical `--auth-choice` value for `openclaw onboard` — onboard handles the
+// full chain (install the provider plugin if missing → run the OAuth/device-code
+// flow → write auth-profiles.json), whereas `models auth login --provider …`
+// assumes the plugin is already installed and 404s with "No provider plugins
+// found" on a fresh ~/.openclaw/. Pure-API-key flows aren't here because the
+// Control UI's Settings → Authentication already covers them.
 const OAUTH_PROVIDERS: &[(&str, &str)] = &[
-    ("google-gemini-cli", "Google Gemini (CLI OAuth)"),
-    ("openai-codex",      "OpenAI Codex (OAuth)"),
-    ("claude-max",        "Claude Max (API proxy login)"),
-    ("github-copilot",    "GitHub Copilot"),
-    ("anthropic",         "Anthropic (API key / token)"),
-    ("openai",            "OpenAI (API key)"),
+    ("claude-cli",          "Claude (Claude.ai login)"),
+    ("openai-codex",        "OpenAI Codex (OAuth)"),
+    ("openai-device-code",  "OpenAI (device code)"),
+    ("google-gemini-cli",   "Google Gemini (CLI OAuth)"),
+    ("github-copilot",      "GitHub Copilot"),
+    ("xai-oauth",           "xAI / Grok (OAuth)"),
 ];
 
 struct PtySession {
@@ -103,12 +105,15 @@ fn pty_start(
             script_path.clone()
         }
     };
+    // Use `openclaw onboard --auth-choice <X>` rather than `models auth login
+    // --provider <X>`: onboard installs the provider plugin first (so a fresh
+    // ~/.openclaw/ doesn't 404 with "No provider plugins found") and then runs
+    // the OAuth/device-code flow in one chained step. The `provider` arg from
+    // the tray submenu is now a canonical --auth-choice id.
     let mut cmd = portable_pty::CommandBuilder::new(&node_path);
     cmd.arg(main_script.as_os_str());
-    cmd.arg("models");
-    cmd.arg("auth");
-    cmd.arg("login");
-    cmd.arg("--provider");
+    cmd.arg("onboard");
+    cmd.arg("--auth-choice");
     cmd.arg(&provider);
     cmd.cwd(&openclaw_dir);
     // openclaw's clack prompter renders with truecolor + box-drawing chars; tell
@@ -170,7 +175,7 @@ fn pty_start(
     }
 
     state.pty.lock().unwrap().replace(PtySession { writer, master: pair.master, killer });
-    eprintln!("[pty] started openclaw models auth login --provider {provider}");
+    eprintln!("[pty] started openclaw onboard --auth-choice {provider}");
     Ok(())
 }
 
