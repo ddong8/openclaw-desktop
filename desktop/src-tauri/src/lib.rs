@@ -605,6 +605,102 @@ fn resolve_sidecar_paths(app: &tauri::AppHandle) -> tauri::Result<(PathBuf, Path
     ))
 }
 
+// ============================================================================
+// Splash progress events
+// ============================================================================
+//
+// The splash window listens for "splash://stage" events with a {stage, detail,
+// percent} payload. Each stage corresponds to a visible phase the user can
+// reason about: spawn → loaded → migrating → waiting-port → ready. The
+// PhaseRecognizer below scans every line the sidecar prints and bumps to the
+// next stage on the first occurrence of a known marker (idempotent across
+// repeated lines).
+
+fn emit_stage(app: &AppHandle, stage: &str, detail: &str, percent: u8) {
+    let _ = app.emit(
+        "splash://stage",
+        serde_json::json!({ "stage": stage, "detail": detail, "percent": percent }),
+    );
+}
+
+struct PhaseRecognizer {
+    app: AppHandle,
+    seen_loaded: bool,
+    seen_migration: bool,
+}
+
+impl PhaseRecognizer {
+    fn new(app: AppHandle) -> Self {
+        Self { app, seen_loaded: false, seen_migration: false }
+    }
+
+    fn observe(&mut self, line: &str) {
+        // openclaw banner: "OpenClaw 2026.x.y (sha) — Running on your hardware…"
+        if !self.seen_loaded && line.contains("OpenClaw ") && line.contains("Running on your hardware") {
+            self.seen_loaded = true;
+            emit_stage(&self.app, "loaded", "openclaw 已加载,正在初始化", 40);
+            return;
+        }
+        // doctor/migration boxes openclaw prints during startup.
+        if !self.seen_migration
+            && (line.contains("Doctor changes")
+                || line.contains("state-migrations")
+                || line.contains("Migrated") && line.contains("legacy"))
+        {
+            self.seen_migration = true;
+            emit_stage(&self.app, "migrating", "运行数据库迁移", 65);
+        }
+    }
+}
+
+// Sequentially install the most-likely OAuth provider plugins via a hidden
+// `node openclaw.mjs plugins install <choice>` subprocess. openclaw treats
+// `plugins install <name>` as idempotent (no-ops if already installed), so
+// running on every launch is cheap after first-time setup. Emits
+// "prefetch://progress" events the tray tooltip listens for.
+fn prefetch_oauth_plugins(node_path: &Path, openclaw_dir: &Path, app: &AppHandle) {
+    // Subset of OAUTH_PROVIDERS — the three most-common first-login picks.
+    // Doing all six would waste ~150 MB of bandwidth on most users.
+    const PREFETCH: &[&str] = &["openai-codex", "google-gemini-cli", "claude-cli"];
+    let total = PREFETCH.len();
+    for (idx, choice) in PREFETCH.iter().enumerate() {
+        let _ = app.emit(
+            "prefetch://progress",
+            serde_json::json!({ "provider": choice, "idx": idx + 1, "total": total, "stage": "installing" }),
+        );
+        let mut cmd = Command::new(node_path);
+        cmd.arg("openclaw.mjs")
+            .arg("plugins")
+            .arg("install")
+            .arg(choice)
+            .current_dir(openclaw_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000);
+        }
+        match cmd.output() {
+            Ok(out) if out.status.success() => {
+                eprintln!("[prefetch] {choice}: ok");
+            }
+            Ok(out) => {
+                eprintln!(
+                    "[prefetch] {choice}: exit {:?}, stderr tail: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("")
+                );
+            }
+            Err(err) => {
+                eprintln!("[prefetch] {choice}: spawn failed: {err}");
+            }
+        }
+    }
+    let _ = app.emit("prefetch://progress", serde_json::json!({ "stage": "all-done" }));
+    eprintln!("[prefetch] all OAuth provider plugins prefetched");
+}
+
 fn spawn_gateway(node_path: &Path, openclaw_dir: &Path) -> std::io::Result<Child> {
     let mut cmd = Command::new(node_path);
     cmd.arg("openclaw.mjs")
@@ -912,24 +1008,35 @@ pub fn run() {
                 tray_builder.build(app)?;
             }
 
+            emit_stage(&app_handle, "spawn", "正在启动 Node sidecar", 10);
+
             let mut child = spawn_gateway(&node_path, &openclaw_dir)?;
 
             // Drain stdout / stderr on plain OS threads (the child is a
             // std::process::Child — no Tokio runtime needed; tokio::process on
             // Unix requires a reactor that isn't present in the setup hook).
+            // Also recognize a few openclaw phase markers and forward them as
+            // `splash://stage` events so the splash window can show a real
+            // progress bar instead of a 60s spinner.
             if let Some(stdout) = child.stdout.take() {
+                let app = app_handle.clone();
                 std::thread::spawn(move || {
                     use std::io::BufRead;
+                    let mut p = PhaseRecognizer::new(app);
                     for line in std::io::BufReader::new(stdout).lines().map_while(Result::ok) {
                         eprintln!("[sidecar:out] {line}");
+                        p.observe(&line);
                     }
                 });
             }
             if let Some(stderr) = child.stderr.take() {
+                let app = app_handle.clone();
                 std::thread::spawn(move || {
                     use std::io::BufRead;
+                    let mut p = PhaseRecognizer::new(app);
                     for line in std::io::BufReader::new(stderr).lines().map_while(Result::ok) {
                         eprintln!("[sidecar:err] {line}");
+                        p.observe(&line);
                     }
                 });
             }
@@ -987,10 +1094,25 @@ pub fn run() {
             }
 
             let ready_handle = app_handle.clone();
+            let prefetch_node = node_path.clone();
+            let prefetch_dir = openclaw_dir.clone();
             tauri::async_runtime::spawn(async move {
+                emit_stage(&ready_handle, "waiting-port", "等待 Gateway 端口 18789 就绪", 85);
                 if wait_for_ready().await {
                     *ready_handle.state::<AppState>().port.lock().unwrap() = Some(GATEWAY_PORT);
                     eprintln!("[sidecar] gateway ready on port {}", GATEWAY_PORT);
+                    emit_stage(&ready_handle, "ready", "Gateway 就绪", 100);
+
+                    // Kick off OAuth-provider plugin prefetch in a background
+                    // thread so the user's first tray "登录 provider…" click
+                    // doesn't pay the 10-30s `plugins install` cost.
+                    {
+                        let app = ready_handle.clone();
+                        std::thread::spawn(move || {
+                            prefetch_oauth_plugins(&prefetch_node, &prefetch_dir, &app);
+                        });
+                    }
+
                     if let Some(window) = ready_handle.get_webview_window("main") {
                         let url = match read_gateway_token() {
                             Some(token) => format!(

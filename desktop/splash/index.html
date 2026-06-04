@@ -11,8 +11,13 @@
     <div class="logo">🦞</div>
     <h1 class="title">OpenClaw</h1>
     <p class="subtitle">Personal AI Assistant</p>
-    <div class="spinner"></div>
-    <div class="status" id="status">正在启动 Gateway…</div>
+
+    <div class="progress-wrap">
+      <div class="progress-bar" id="bar"></div>
+    </div>
+
+    <div class="status" id="status">正在启动…</div>
+    <div class="elapsed" id="elapsed"></div>
     <div class="error" id="error" hidden></div>
   </div>
   <script src="splash.js"></script>
