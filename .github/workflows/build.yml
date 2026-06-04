@@ -30,7 +30,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          # Pin to 24.15.0. Node 24.16.0 regressed lstat/realpath of `C:` on
+          # Windows, breaking spawn'd `node openclaw.mjs ...` from the PTY
+          # OAuth terminal with: EISDIR illegal operation on a directory,
+          # lstat 'C:' (during Node's resolveMainPath). Our prepare-bundle
+          # scripts download Node from nodejs.org matching `node -v`, so
+          # pinning here cascades into the bundle.
+          node-version: "24.15.0"
 
       - name: Enable pnpm via corepack
         shell: bash

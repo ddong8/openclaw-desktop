@@ -83,8 +83,14 @@ fn pty_start(
         .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("openpty failed: {e}"))?;
 
+    // Pass the script as an ABSOLUTE path. Node 24.16.0 on Windows regressed
+    // relative-script-path resolution via realpath (`EISDIR lstat 'C:'` from
+    // resolveMainPath); an absolute path bypasses Module._findPath's drive-
+    // root traversal entirely. Also robust against any future CWD-handling
+    // quirks in portable-pty's Windows ConPTY backend.
+    let script_path = openclaw_dir.join("openclaw.mjs");
     let mut cmd = portable_pty::CommandBuilder::new(&node_path);
-    cmd.arg("openclaw.mjs");
+    cmd.arg(script_path.as_os_str());
     cmd.arg("models");
     cmd.arg("auth");
     cmd.arg("login");
