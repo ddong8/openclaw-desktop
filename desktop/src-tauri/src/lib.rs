@@ -486,26 +486,68 @@ async fn wait_for_ready() -> bool {
 }
 
 // Check GitHub Releases for a newer signed build; prompt the user, then
-// download + install + restart. Runs best-effort: any failure (offline,
-// no update, GitHub unreachable) is logged and ignored.
-async fn check_for_update(app: tauri::AppHandle) {
+// download + install + restart.
+//
+// `manual` distinguishes auto-checks (15s after launch, silent on no-update /
+// network failure) from user-triggered checks (tray "升级 OpenClaw", which must
+// always surface the result — silence reads as "button is broken"). Audit
+// finding: every non-success branch was eprintln-to-stderr only, invisible in
+// Windows release builds.
+async fn check_for_update(app: tauri::AppHandle, manual: bool) {
     use tauri_plugin_updater::UpdaterExt;
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    let show_info = |title: &str, msg: String| {
+        if manual {
+            let _ = app.dialog()
+                .message(msg)
+                .title(title)
+                .kind(MessageDialogKind::Info)
+                .blocking_show();
+        }
+    };
+    let show_error = |title: &str, msg: String| {
+        if manual {
+            let _ = app.dialog()
+                .message(msg)
+                .title(title)
+                .kind(MessageDialogKind::Error)
+                .blocking_show();
+        }
+    };
 
     let updater = match app.updater() {
         Ok(u) => u,
-        Err(err) => { eprintln!("[updater] init failed: {err}"); return; }
+        Err(err) => {
+            eprintln!("[updater] init failed: {err}");
+            show_error("更新检查失败", format!("更新组件初始化失败:{err}"));
+            return;
+        }
     };
     let update = match updater.check().await {
         Ok(Some(u)) => u,
-        Ok(None) => { eprintln!("[updater] already up to date"); return; }
-        Err(err) => { eprintln!("[updater] check failed: {err}"); return; }
+        Ok(None) => {
+            eprintln!("[updater] already up to date");
+            show_info(
+                "已是最新版本",
+                format!("OpenClaw 已是最新版本(v{})。", env!("CARGO_PKG_VERSION")),
+            );
+            return;
+        }
+        Err(err) => {
+            eprintln!("[updater] check failed: {err}");
+            show_error(
+                "更新检查失败",
+                format!("无法连接到更新服务器:{err}\n可前往 GitHub Releases 手动下载。"),
+            );
+            return;
+        }
     };
 
     let new_ver = update.version.clone();
     let cur_ver = update.current_version.clone();
     eprintln!("[updater] update available: {cur_ver} -> {new_ver}");
 
-    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
     let approved = app
         .dialog()
         .message(format!(
@@ -684,7 +726,7 @@ pub fn run() {
                                 // Check GitHub Releases via tauri-plugin-updater
                                 // (downloads a newer signed build of the whole app).
                                 eprintln!("[tray] manual update check requested");
-                                tauri::async_runtime::spawn(check_for_update(app.clone()));
+                                tauri::async_runtime::spawn(check_for_update(app.clone(), true));
                             }
                             "quit" => {
                                 app.exit(0);
@@ -817,7 +859,7 @@ pub fn run() {
                 let update_handle = app_handle.clone();
                 tauri::async_runtime::spawn(async move {
                     tokio::time::sleep(Duration::from_secs(15)).await;
-                    check_for_update(update_handle).await;
+                    check_for_update(update_handle, false).await;
                 });
             }
 
