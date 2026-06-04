@@ -78,6 +78,15 @@ fn pty_start(
     let openclaw_dir = state.openclaw_dir.lock().unwrap().clone()
         .ok_or_else(|| "openclaw dir not initialized".to_string())?;
 
+    // Both come from Tauri's app.path().resource_dir() which on Windows
+    // returns canonicalized verbatim paths (`\\?\C:\…`). The prefix breaks
+    // Node's resolveMainPath realpath ("lstat 'C:' EISDIR") AND our
+    // path_to_file_url (yielding malformed `file://///?/C:/…`). Strip once
+    // here so the launcher path, file:// URL, cwd, and the Node exe arg are
+    // all the plain `C:\…` form Node expects.
+    let node_path = strip_verbatim_prefix(&node_path);
+    let openclaw_dir = strip_verbatim_prefix(&openclaw_dir);
+
     let pty_system = portable_pty::native_pty_system();
     let pair = pty_system
         .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -248,6 +257,29 @@ fn urlencoding_simple(s: &str) -> String {
         .collect()
 }
 
+// Strip Windows verbatim path prefixes (`\\?\C:\…` → `C:\…`, `\??\C:\…` → `C:\…`).
+// Tauri 2's app.path().resource_dir() returns canonicalized verbatim paths on
+// Windows when the install lives under `C:\Program Files\…`. Node's
+// resolveMainPath / realpath chokes on these (lstat 'C:' EISDIR), and the
+// prefix obviously also breaks file:// URL construction. Strip once, use the
+// clean path everywhere we cross into Node.
+fn strip_verbatim_prefix(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    for prefix in [r"\\?\UNC\", r"\\?\", r"\??\"] {
+        if let Some(rest) = s.strip_prefix(prefix) {
+            // For UNC ("\\?\UNC\server\share\..."), the rest is "server\share\..."
+            // which has to become "\\server\share\...". For drive-rooted variants
+            // ("\\?\C:\..." / "\??\C:\..."), rest is already a normal Win32 path.
+            return if prefix == r"\\?\UNC\" {
+                PathBuf::from(format!(r"\\{}", rest))
+            } else {
+                PathBuf::from(rest.to_string())
+            };
+        }
+    }
+    p.to_path_buf()
+}
+
 // Write a tiny ESM launcher to %TEMP%/openclaw-pty-launcher.mjs that imports
 // the real openclaw.mjs by file:// URL. See pty_start for the why — this side-
 // steps Node's resolveMainPath realpath on the `Program Files\…` path that
@@ -255,9 +287,13 @@ fn urlencoding_simple(s: &str) -> String {
 // process.argv so openclaw's CLI argument parser sees the same shape as if it
 // had been invoked directly with `node openclaw.mjs <args>`.
 fn write_pty_launcher(real_script: &Path) -> std::io::Result<PathBuf> {
+    // Strip \\?\ before constructing the URL — Tauri's resource_dir returns
+    // verbatim paths on perMachine Windows installs which would otherwise leak
+    // into `file://///?/C:/...` and trigger ERR_INVALID_FILE_URL_PATH.
+    let clean_script = strip_verbatim_prefix(real_script);
     let launcher_path = std::env::temp_dir().join("openclaw-pty-launcher.mjs");
-    let real_path_str = real_script.to_string_lossy().into_owned();
-    let real_path_url = path_to_file_url(real_script);
+    let real_path_str = clean_script.to_string_lossy().into_owned();
+    let real_path_url = path_to_file_url(&clean_script);
     // serde_json::to_string handles the JS-string escaping (backslashes etc.)
     let argv1_lit = serde_json::to_string(&real_path_str).unwrap();
     let url_lit = serde_json::to_string(&real_path_url).unwrap();
@@ -275,7 +311,8 @@ fn write_pty_launcher(real_script: &Path) -> std::io::Result<PathBuf> {
 // `C:\Program Files\OpenClaw\…\openclaw.mjs` → `file:///C:/Program%20Files/OpenClaw/…/openclaw.mjs`
 // Only encodes characters that are unsafe in a URL path component. Drive letter
 // + colon is kept (legal in file:// URLs per WHATWG URL spec for the host-less
-// triple-slash form).
+// triple-slash form). Caller MUST pass a path with no `\\?\` verbatim prefix —
+// use strip_verbatim_prefix() first.
 fn path_to_file_url(p: &Path) -> String {
     let s = p.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file:///");
