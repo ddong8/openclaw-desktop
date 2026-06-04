@@ -210,6 +210,149 @@ fn pty_close(state: tauri::State<AppState>) -> Result<(), String> {
     Ok(())
 }
 
+// Spawn an interactive shell with `openclaw` available on PATH so the user can
+// run any subcommand (config get/set/patch, plugins list/install, models …).
+// Same PTY plumbing as pty_start, just spawns cmd.exe / $SHELL instead of
+// openclaw onboard. The openclaw wrapper is written to %TEMP% (Windows) /
+// $TMPDIR (Unix) at runtime so spaces in the install path don't bite cmd.exe.
+#[tauri::command]
+fn pty_start_shell(
+    rows: u16,
+    cols: u16,
+    app: AppHandle,
+    state: tauri::State<AppState>,
+) -> Result<(), String> {
+    if let Some(prev) = state.pty.lock().unwrap().take() {
+        let mut killer = prev.killer;
+        let _ = killer.kill();
+        drop(prev.writer);
+        drop(prev.master);
+    }
+
+    let node_path = state.node_path.lock().unwrap().clone()
+        .ok_or_else(|| "node path not initialized".to_string())?;
+    let openclaw_dir = state.openclaw_dir.lock().unwrap().clone()
+        .ok_or_else(|| "openclaw dir not initialized".to_string())?;
+
+    // Write an `openclaw` wrapper next to %TEMP%/openclaw-pty-launcher.mjs so
+    // the user can just type `openclaw config get gateway.port` instead of the
+    // full `<node-path> <openclaw.mjs> ...` incantation.
+    let wrapper_dir = std::env::temp_dir().join("openclaw-shell-bin");
+    if let Err(err) = std::fs::create_dir_all(&wrapper_dir) {
+        return Err(format!("create wrapper dir failed: {err}"));
+    }
+    let script_path = openclaw_dir.join("openclaw.mjs");
+    let wrapper_name = if cfg!(windows) { "openclaw.cmd" } else { "openclaw" };
+    let wrapper_path = wrapper_dir.join(wrapper_name);
+    let wrapper_content = if cfg!(windows) {
+        // /Q to silence the cmd echo prefix, /S so leading-quoted exe is parsed
+        // robustly. `%*` forwards all args verbatim including quoting.
+        format!(
+            "@echo off\r\n\"{node}\" \"{script}\" %*\r\n",
+            node = node_path.display(),
+            script = script_path.display(),
+        )
+    } else {
+        format!(
+            "#!/bin/sh\nexec \"{node}\" \"{script}\" \"$@\"\n",
+            node = node_path.display(),
+            script = script_path.display(),
+        )
+    };
+    if let Err(err) = std::fs::write(&wrapper_path, &wrapper_content) {
+        return Err(format!("write wrapper failed: {err}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| format!("openpty failed: {e}"))?;
+
+    let shell_exe = if cfg!(windows) {
+        std::env::var_os("ComSpec")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+    } else {
+        std::env::var_os("SHELL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/bin/bash"))
+    };
+
+    let mut cmd = portable_pty::CommandBuilder::new(&shell_exe);
+    cmd.cwd(&openclaw_dir);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd.env("FORCE_COLOR", "1");
+    // Prepend our wrapper dir so `openclaw` resolves to it. portable-pty inherits
+    // the parent env by default for everything we don't override.
+    let prepend = wrapper_dir.display().to_string();
+    if cfg!(windows) {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{prepend};{existing}"));
+    } else {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        cmd.env("PATH", format!("{prepend}:{existing}"));
+    }
+    // Friendly banner injected via PROMPT (cmd) / PS1 (bash); printed before the
+    // first prompt so the user knows what to type.
+    if cfg!(windows) {
+        // cmd /K stays open after the auto-run.
+        cmd.arg("/K");
+        cmd.arg(format!(
+            "echo openclaw shell ready -- type \"openclaw --help\" to start && prompt openclaw$G "
+        ));
+    }
+
+    let mut child = pair.slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    drop(pair.slave);
+
+    let reader = pair.master.try_clone_reader().map_err(|e| format!("clone reader failed: {e}"))?;
+    let writer = pair.master.take_writer().map_err(|e| format!("take writer failed: {e}"))?;
+    let killer = child.clone_killer();
+
+    {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let chunk = String::from_utf8_lossy(&buf[..n]).into_owned();
+                        if app.emit("pty://output", serde_json::json!({ "data": chunk })).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            let status = child.wait();
+            let code = match status {
+                Ok(s) => s.exit_code() as i64,
+                Err(_) => -1,
+            };
+            let _ = app.emit("pty://exit", serde_json::json!({ "code": code }));
+        });
+    }
+
+    state.pty.lock().unwrap().replace(PtySession { writer, master: pair.master, killer });
+    eprintln!("[pty] opened openclaw shell ({} on PATH via {})", wrapper_name, wrapper_dir.display());
+    Ok(())
+}
+
 fn open_login_terminal_window(app: &AppHandle, provider: &str) -> Result<(), tauri::Error> {
     // Reuse a single window across providers — closing the old one first kills
     // the old PTY too (via on_window_event below).
@@ -220,9 +363,14 @@ fn open_login_terminal_window(app: &AppHandle, provider: &str) -> Result<(), tau
     // a PathBuf and some backends strip the query, but fragments ride through
     // intact since they're never sent in the HTTP request line.
     let url = format!("terminal/index.html#{}", urlencoding_simple(provider));
+    let title = if provider == "__shell__" {
+        "OpenClaw — openclaw 终端".to_string()
+    } else {
+        format!("OpenClaw — Sign in to {provider}")
+    };
     let app_for_close = app.clone();
     WebviewWindowBuilder::new(app, "login-terminal", WebviewUrl::App(url.into()))
-        .title(format!("OpenClaw — Sign in to {provider}"))
+        .title(title)
         .inner_size(820.0, 520.0)
         .min_inner_size(640.0, 360.0)
         .resizable(true)
@@ -850,6 +998,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_api_port,
             pty_start,
+            pty_start_shell,
             pty_input,
             pty_resize,
             pty_close,
@@ -913,10 +1062,11 @@ pub fn run() {
                     &provider_items.iter().map(|i| i as &dyn tauri::menu::IsMenuItem<_>).collect::<Vec<_>>(),
                 )?;
 
+                // 托盘左键已经是"显示主窗口",所以不再放重复的 "显示窗口" 菜单项。
+                // 三个功能区:openclaw 子命令(登录 / 终端)→ 配置入口 → 生命周期 → 信息。
                 let menu = Menu::with_items(app, &[
-                    &MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?,
-                    &PredefinedMenuItem::separator(app)?,
                     &login_submenu,
+                    &MenuItem::with_id(app, "open_shell", "打开 openclaw 终端", true, None::<&str>)?,
                     &PredefinedMenuItem::separator(app)?,
                     &MenuItem::with_id(app, "open_config", "打开配置文件", true, None::<&str>)?,
                     &MenuItem::with_id(app, "open_data", "打开配置目录", true, None::<&str>)?,
@@ -953,11 +1103,9 @@ pub fn run() {
                     .on_menu_event(move |app, event| {
                         let id = event.id.as_ref();
                         match id {
-                            "show" => {
-                                if let Some(w) = app.get_webview_window("main") {
-                                    let _ = w.show();
-                                    let _ = w.unminimize();
-                                    let _ = w.set_focus();
+                            "open_shell" => {
+                                if let Err(err) = open_login_terminal_window(app, "__shell__") {
+                                    eprintln!("[tray] open openclaw shell failed: {err}");
                                 }
                             }
                             "open_config" => {

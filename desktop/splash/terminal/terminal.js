@@ -1,15 +1,25 @@
-// Mini terminal window: wires xterm.js to a PTY-spawned `openclaw models auth
-// login --provider <X>` running inside the embedded Node sidecar. Backed by
-// portable-pty in the Rust shell — interactive prompts (clack), arrow-key
-// menus, and the OAuth callback URL all render here. When the subprocess
-// exits, the window stays open briefly so the user can read the final lines.
+// PTY window. Two modes determined by the URL fragment:
+//
+//   #__shell__   — interactive openclaw shell (cmd.exe / $SHELL with the
+//                  `openclaw` wrapper on PATH). User can run any CLI subcommand.
+//   #<provider>  — `openclaw onboard --auth-choice <provider>` for OAuth sign-in.
+//
+// Output (PTY → xterm) is broadcast via `pty://output`; keystrokes go back via
+// the pty_input command. pty_exit fires once the child terminates.
 
 (function () {
-  // Provider id comes in via the URL fragment (#<provider>) — fragments
-  // survive Tauri's PathBuf-based WebviewUrl::App resolution more reliably
-  // than query strings on all three platforms.
-  const provider = decodeURIComponent((window.location.hash || "#").slice(1)) || "anthropic";
-  document.getElementById("provider").textContent = provider;
+  const raw = decodeURIComponent((window.location.hash || "#").slice(1));
+  const isShell = raw === "__shell__";
+  const provider = raw || "anthropic";
+  document.getElementById("provider").textContent = isShell ? "interactive shell" : provider;
+
+  // Adjust the header for shell mode — different command, different intent.
+  const headerEl = document.getElementById("header");
+  if (isShell && headerEl) {
+    headerEl.innerHTML =
+      'openclaw shell &mdash; <strong>type <code>openclaw --help</code></strong> ' +
+      '<span id="status"></span>';
+  }
 
   const term = new Terminal({
     fontFamily: 'Menlo, "Cascadia Code", "Consolas", monospace',
@@ -39,11 +49,12 @@
 
   const statusEl = document.getElementById("status");
   function setStatus(text, cls) {
-    statusEl.textContent = text;
-    statusEl.className = cls || "";
+    if (statusEl) {
+      statusEl.textContent = text;
+      statusEl.className = cls || "";
+    }
   }
 
-  // Pump output: Rust emits `pty://output` { data: string (utf-8 chunk) }.
   listen("pty://output", (e) => {
     if (e && e.payload && typeof e.payload.data === "string") {
       term.write(e.payload.data);
@@ -57,31 +68,26 @@
     term.write(`\r\n\x1b[2m[${ok ? "done" : "exited code " + code}]\x1b[0m\r\n`);
   });
 
-  // Send input: keyboard → Rust writes to PTY stdin.
   term.onData((data) => {
     invoke("pty_input", { input: data }).catch((err) => {
       term.write(`\r\n\x1b[31m[input error] ${err}\x1b[0m\r\n`);
     });
   });
 
-  // Resize PTY when the window/terminal viewport changes (xterm computes
-  // rows/cols from the container, FitAddon syncs them).
   function syncSize() {
     fitAddon.fit();
     invoke("pty_resize", { rows: term.rows, cols: term.cols }).catch(() => {});
   }
   window.addEventListener("resize", syncSize);
 
-  // Kick off the PTY-backed openclaw subprocess. Rust window-shows + invokes
-  // this command once the window is ready.
   setStatus("· starting…");
-  invoke("pty_start", { provider, rows: term.rows, cols: term.cols })
+  const startCall = isShell
+    ? invoke("pty_start_shell", { rows: term.rows, cols: term.cols })
+    : invoke("pty_start",       { provider, rows: term.rows, cols: term.cols });
+  startCall
     .then(() => setStatus("· running…"))
     .catch((err) => {
       setStatus("· failed to start", "err");
       term.write(`\r\n\x1b[31m[start error] ${err}\x1b[0m\r\n`);
     });
-
-  // When the user closes the window, Rust drops the PTY which kills the child.
-  // Nothing extra needed here.
 })();
