@@ -543,6 +543,34 @@ fn openclaw_config_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".openclaw").join("openclaw.json"))
 }
 
+// ~/.openclaw/.node-compile-cache — Node 22's V8 bytecode cache directory.
+// Pointing NODE_COMPILE_CACHE here cuts ~200-500ms off subsequent cold starts
+// of openclaw.mjs (gateway + short-lived CLI runs). We create the dir if
+// missing because Node only *uses* the cache when the directory already exists
+// and is writable; it logs a warning and falls back to no-cache otherwise.
+fn node_compile_cache_dir() -> Option<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .ok()?;
+    let dir = PathBuf::from(home).join(".openclaw").join(".node-compile-cache");
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        eprintln!("[env] failed to create node compile cache dir {:?}: {err}", dir);
+        return None;
+    }
+    Some(dir)
+}
+
+// Apply NODE_COMPILE_CACHE + OPENCLAW_NO_AUTO_UPDATE to every node child we
+// spawn. The desktop shell owns its update channel via tauri-plugin-updater +
+// our "升级 OpenClaw" tray item, so the embedded openclaw must never try to
+// self-update — that would race with the shell installer and confuse users.
+fn apply_node_perf_env(cmd: &mut Command) {
+    if let Some(dir) = node_compile_cache_dir() {
+        cmd.env("NODE_COMPILE_CACHE", dir);
+    }
+    cmd.env("OPENCLAW_NO_AUTO_UPDATE", "1");
+}
+
 fn read_config_value() -> Option<serde_json::Value> {
     let path = openclaw_config_path()?;
     let content = std::fs::read_to_string(&path).ok()?;
@@ -611,6 +639,8 @@ fn run_openclaw_cli(
         // from a terminal (helps diagnose first-run config failures).
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
+    // v2026.6.11: NODE_COMPILE_CACHE + OPENCLAW_NO_AUTO_UPDATE for every node spawn.
+    apply_node_perf_env(&mut cmd);
 
     #[cfg(windows)]
     {
@@ -784,11 +814,14 @@ impl PhaseRecognizer {
             emit_stage(&self.app, "loaded", "openclaw 已加载,正在初始化", 40);
             return;
         }
-        // doctor/migration boxes openclaw prints during startup.
+        // doctor/migration boxes openclaw prints during startup. The
+        // STARTUP_TRACE env (debug builds) emits module paths that contain
+        // `state-migrations` as a dist filename — guard against spurious bumps
+        // by requiring it to co-occur with the verb "Migrated" or "Doctor".
         if !self.seen_migration
             && (line.contains("Doctor changes")
-                || line.contains("state-migrations")
-                || line.contains("Migrated") && line.contains("legacy"))
+                || (line.contains("Migrated") && line.contains("legacy"))
+                || (line.contains("state-migrations") && line.contains("Auto-migrated")))
         {
             self.seen_migration = true;
             emit_stage(&self.app, "migrating", "运行数据库迁移", 65);
@@ -816,6 +849,8 @@ fn prefetch_oauth_plugins(node_path: &Path, openclaw_dir: &Path, app: &AppHandle
             .current_dir(openclaw_dir)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // v2026.6.11: NODE_COMPILE_CACHE + OPENCLAW_NO_AUTO_UPDATE for every node spawn.
+        apply_node_perf_env(&mut cmd);
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -850,6 +885,13 @@ fn spawn_gateway(node_path: &Path, openclaw_dir: &Path) -> std::io::Result<Child
         .current_dir(openclaw_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+    // v2026.6.11: NODE_COMPILE_CACHE + OPENCLAW_NO_AUTO_UPDATE for every node spawn.
+    apply_node_perf_env(&mut cmd);
+    // STARTUP_TRACE only in debug builds — in release it emits ~30-80 trace
+    // lines per launch (per-plugin manifest registry + installed-index +
+    // owner-map timings), which would just bloat user crash logs.
+    #[cfg(debug_assertions)]
+    cmd.env("OPENCLAW_GATEWAY_STARTUP_TRACE", "1");
 
     #[cfg(windows)]
     {
@@ -986,6 +1028,12 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
+        // NOTE: autostart deferred to v2026.6.12 — the auto-launch 0.5.0 crate
+        // that tauri-plugin-autostart wraps does NOT quote the EXE path it
+        // writes into HKCU\…\Run, so a perMachine install at
+        // `C:\Program Files\OpenClaw\OpenClaw.exe` would silently fail to
+        // launch (Windows parses "C:\Program" as the EXE). Need to either fork
+        // the lib or write the Run key ourselves before re-enabling.
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             get_api_port,

@@ -18,6 +18,9 @@ tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-dialog = "2"
+# tauri-plugin-autostart = "2"  # v2026.6.12 — held back; auto-launch 0.5.0
+#                                  doesn't quote app_path on Windows, breaking
+#                                  perMachine `C:\Program Files\...` installs.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process"] }
