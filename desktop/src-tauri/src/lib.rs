@@ -1239,7 +1239,7 @@ pub fn run() {
                     &PredefinedMenuItem::separator(app)?,
                     &MenuItem::with_id(app, "about", &about_label, false, None::<&str>)?,
                     &PredefinedMenuItem::separator(app)?,
-                    &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "quit", "退出 (停止 Gateway)", true, None::<&str>)?,
                 ])?;
 
                 let mut tray_builder = TrayIconBuilder::with_id("main-tray")
@@ -1300,7 +1300,32 @@ pub fn run() {
                                 tauri::async_runtime::spawn(check_for_update(app.clone(), true));
                             }
                             "quit" => {
-                                app.exit(0);
+                                // Most users hit close-to-tray on the window and
+                                // never actually intend to stop the Gateway —
+                                // an accidental "退出" click forfeits the warm
+                                // openclaw runtime and incurs a 10-30s
+                                // cold-restart next launch. Confirm first.
+                                use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+                                let approved = app
+                                    .dialog()
+                                    .message(
+                                        "确定退出 OpenClaw 吗?\n\n\
+                                         退出会停止后台 Gateway,下次打开需要重新加载 openclaw 运行时(约 10-30 秒)。\n\n\
+                                         如果只是不想看主窗口,直接关闭窗口即可——Gateway 会继续在托盘后台运行。"
+                                    )
+                                    .title("退出 OpenClaw")
+                                    .kind(MessageDialogKind::Warning)
+                                    .buttons(MessageDialogButtons::OkCancelCustom(
+                                        "退出并停止".to_string(),
+                                        "取消".to_string(),
+                                    ))
+                                    .blocking_show();
+                                if approved {
+                                    eprintln!("[tray] user confirmed quit — stopping gateway");
+                                    app.exit(0);
+                                } else {
+                                    eprintln!("[tray] quit canceled by user");
+                                }
                             }
                             _ => {}
                         }
