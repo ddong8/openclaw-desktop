@@ -522,6 +522,70 @@ mod path_tests {
         // and the buggy form must NOT appear
         assert!(!out.starts_with("file:///"));
     }
+
+    // --- gateway-config patch merge ---
+
+    #[test]
+    fn merge_into_empty_writes_all_six_keys() {
+        let mut root = serde_json::json!({});
+        merge_gateway_patch_into(&mut root, "deadbeef", 18789);
+        let g = &root["gateway"];
+        assert_eq!(g["mode"], "local");
+        assert_eq!(g["port"], 18789);
+        assert_eq!(g["bind"], "loopback");
+        assert_eq!(g["auth"]["mode"], "token");
+        assert_eq!(g["auth"]["token"], "deadbeef");
+        assert_eq!(g["controlUi"]["dangerouslyDisableDeviceAuth"], true);
+        assert_eq!(g["controlUi"]["allowInsecureAuth"], true);
+    }
+
+    #[test]
+    fn merge_preserves_unrelated_top_level_keys() {
+        let mut root = serde_json::json!({
+            "skills": { "entries": { "foo": "bar" } },
+            "channels": { "telegram": { "enabled": true } }
+        });
+        merge_gateway_patch_into(&mut root, "abc", 18789);
+        assert_eq!(root["skills"]["entries"]["foo"], "bar");
+        assert_eq!(root["channels"]["telegram"]["enabled"], true);
+        assert_eq!(root["gateway"]["mode"], "local");
+    }
+
+    #[test]
+    fn merge_preserves_unrelated_gateway_subkeys() {
+        // openclaw's own `config patch` only updates the six keys we own and
+        // leaves sibling gateway.* sub-objects (tailscale, nodes, etc.) alone.
+        // We need the same behavior or we'd accidentally wipe user setup.
+        let mut root = serde_json::json!({
+            "gateway": {
+                "mode": "OLD",
+                "tailscale": { "mode": "serve", "resetOnExit": false },
+                "nodes": { "denyCommands": ["camera.snap"] },
+                "controlUi": { "customUserField": "keep-me" }
+            }
+        });
+        merge_gateway_patch_into(&mut root, "tok", 18789);
+        let g = &root["gateway"];
+        // Our six are written
+        assert_eq!(g["mode"], "local");
+        assert_eq!(g["auth"]["token"], "tok");
+        assert_eq!(g["controlUi"]["dangerouslyDisableDeviceAuth"], true);
+        // Sibling gateway subkeys must survive
+        assert_eq!(g["tailscale"]["mode"], "serve");
+        assert_eq!(g["nodes"]["denyCommands"][0], "camera.snap");
+        // Sibling controlUi subkey must survive
+        assert_eq!(g["controlUi"]["customUserField"], "keep-me");
+    }
+
+    #[test]
+    fn merge_overwrites_non_object_gateway() {
+        // If gateway is somehow not an object (corrupt config), we replace it
+        // with a fresh object rather than crashing.
+        let mut root = serde_json::json!({ "gateway": "this is a string" });
+        merge_gateway_patch_into(&mut root, "x", 18789);
+        assert!(root["gateway"].is_object());
+        assert_eq!(root["gateway"]["mode"], "local");
+    }
 }
 
 // Read OpenClaw's npm package version from <openclaw_dir>/package.json so the
@@ -694,23 +758,102 @@ fn ensure_openclaw_config(node_path: &std::path::Path, openclaw_dir: &std::path:
         return; // warm start — already fully configured, zero latency
     }
 
-    let token = read_gateway_token().unwrap_or_else(|| generate_token_hex(24));
-    let patch = format!(
-        r#"{{"gateway":{{"mode":"local","auth":{{"mode":"token","token":"{token}"}},"port":18789,"bind":"loopback","controlUi":{{"dangerouslyDisableDeviceAuth":true,"allowInsecureAuth":true}}}}}}"#
-    );
-    eprintln!("[config] applying gateway config via `config patch` (non-interactive)");
-    let status = run_openclaw_cli(
-        node_path,
-        openclaw_dir,
-        &["config", "patch", "--stdin"],
-        Some(&patch),
-        Duration::from_secs(60),
-    );
-    match status {
-        Some(s) if s.success() => eprintln!("[config] config patch applied"),
-        Some(s) => eprintln!("[config] config patch exited with {s:?}"),
-        None => eprintln!("[config] config patch failed/timed out — gateway may require manual setup"),
+    // v2026.6.12: write the same JSON patch ourselves in Rust instead of
+    // spawning a 5-15s `node openclaw.mjs config patch --stdin` cold-start.
+    // The keys are dead simple (gateway.{mode,port,bind,auth.*,controlUi.*})
+    // and openclaw's own `config patch` does a RFC-7396 JSON merge — easy to
+    // replicate via serde_json. Fall back to the slow path if anything fails,
+    // so a malformed pre-existing config can't soft-brick first launch.
+    match apply_gateway_config_patch_native() {
+        Ok(()) => eprintln!("[config] native gateway-config patch written (skipped node spawn)"),
+        Err(err) => {
+            eprintln!("[config] native patch failed: {err} — falling back to `config patch --stdin`");
+            let token = read_gateway_token().unwrap_or_else(|| generate_token_hex(24));
+            let patch = format!(
+                r#"{{"gateway":{{"mode":"local","auth":{{"mode":"token","token":"{token}"}},"port":18789,"bind":"loopback","controlUi":{{"dangerouslyDisableDeviceAuth":true,"allowInsecureAuth":true}}}}}}"#
+            );
+            let status = run_openclaw_cli(
+                node_path,
+                openclaw_dir,
+                &["config", "patch", "--stdin"],
+                Some(&patch),
+                Duration::from_secs(60),
+            );
+            match status {
+                Some(s) if s.success() => eprintln!("[config] fallback config patch applied"),
+                Some(s) => eprintln!("[config] fallback config patch exited with {s:?}"),
+                None => eprintln!("[config] fallback config patch failed/timed out — gateway may require manual setup"),
+            }
+        }
     }
+}
+
+// Pure merge — testable. Idempotent and non-destructive: every top-level key
+// other than `gateway` is left alone, and inside `gateway` only the six fields
+// we own are inserted/overwritten (mode, port, bind, auth.mode, auth.token,
+// controlUi.dangerouslyDisableDeviceAuth, controlUi.allowInsecureAuth).
+fn merge_gateway_patch_into(root: &mut serde_json::Value, token: &str, port: u16) {
+    if !root.is_object() {
+        *root = serde_json::json!({});
+    }
+    let root_obj = root.as_object_mut().unwrap();
+    let gateway = root_obj.entry("gateway".to_string()).or_insert(serde_json::json!({}));
+    if !gateway.is_object() {
+        *gateway = serde_json::json!({});
+    }
+    let g = gateway.as_object_mut().unwrap();
+    g.insert("mode".into(), serde_json::Value::String("local".into()));
+    g.insert("port".into(), serde_json::json!(port));
+    g.insert("bind".into(), serde_json::Value::String("loopback".into()));
+
+    let auth = g.entry("auth".to_string()).or_insert(serde_json::json!({}));
+    if !auth.is_object() {
+        *auth = serde_json::json!({});
+    }
+    let a = auth.as_object_mut().unwrap();
+    a.insert("mode".into(), serde_json::Value::String("token".into()));
+    a.insert("token".into(), serde_json::Value::String(token.to_string()));
+
+    let ui = g.entry("controlUi".to_string()).or_insert(serde_json::json!({}));
+    if !ui.is_object() {
+        *ui = serde_json::json!({});
+    }
+    let u = ui.as_object_mut().unwrap();
+    u.insert("dangerouslyDisableDeviceAuth".into(), serde_json::json!(true));
+    u.insert("allowInsecureAuth".into(), serde_json::json!(true));
+}
+
+// Pure-Rust replacement for `openclaw config patch --stdin` when all we want
+// is to seed the gateway-side keys. Atomic via tempfile+rename so a malformed
+// pre-existing config can never half-write.
+fn apply_gateway_config_patch_native() -> Result<(), String> {
+    let path = openclaw_config_path().ok_or_else(|| "no home dir".to_string())?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+    }
+
+    let mut root: serde_json::Value = if path.exists() {
+        let s = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
+        if s.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&s).map_err(|e| format!("parse {path:?}: {e}"))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    // Reuse existing token if present so we don't churn it on every launch
+    // (that would invalidate any Control UI session in another browser tab).
+    let token = read_gateway_token().unwrap_or_else(|| generate_token_hex(24));
+    merge_gateway_patch_into(&mut root, &token, GATEWAY_PORT);
+
+    let pretty = serde_json::to_string_pretty(&root).map_err(|e| format!("serialize: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, pretty).map_err(|e| format!("write {tmp:?}: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename {tmp:?} -> {path:?}: {e}"))?;
+    Ok(())
 }
 
 fn read_gateway_token() -> Option<String> {
