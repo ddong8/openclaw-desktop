@@ -99,11 +99,41 @@ jobs:
 
       # Build + sign + upload to a single GitHub Release, and merge the
       # cross-platform updater manifest (latest.json) used by the in-app updater.
+      # `continue-on-error: false` + the rerun-on-504 wrapper below: tauri-action
+      # occasionally hits HTTP 504 from GitHub's Releases upload API on >100MB
+      # NSIS/DMG payloads. When that happens the matrix job fails AND the
+      # cross-platform latest.json gets merged WITHOUT the failed platform's
+      # entry — clients on that platform then hit "None of the fallback
+      # platforms found in response" until someone reruns the job. The retry
+      # makes the same payload bake another time before giving up.
       - name: Build, sign, release
+        id: tauri_action
         uses: tauri-apps/tauri-action@v0
+        continue-on-error: true
         env:
           # Prefer a PAT (RELEASE_TOKEN) — the default GITHUB_TOKEN can't create
           # releases on this repo. Falls back to GITHUB_TOKEN if PAT absent.
+          GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.0.0-dev' }}
+          releaseName: "OpenClaw ${{ github.ref_name }}"
+          releaseBody: "OpenClaw Desktop — automated release. See assets below for your platform. The app auto-updates from this channel."
+          releaseDraft: false
+          prerelease: false
+          includeUpdaterJson: true
+          args: ${{ matrix.args }}
+
+      # If the first tauri-action attempt fell over on a transient GitHub
+      # Releases 504 (or any other non-build issue), give it one more shot
+      # before we ship a one-platform-missing latest.json that breaks the
+      # in-app updater on whichever platform got dropped.
+      - name: Retry tauri-action on transient failure
+        if: steps.tauri_action.outcome == 'failure'
+        uses: tauri-apps/tauri-action@v0
+        env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
